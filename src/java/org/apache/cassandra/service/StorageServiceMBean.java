@@ -624,7 +624,7 @@ public interface StorageServiceMBean extends NotificationEmitter
     public String getDrainProgress();
 
     /** makes node unavailable for writes, flushes memtables and replays commitlog. */
-    public void drain() throws IOException, InterruptedException, ExecutionException;
+    public void drain() throws IOException, InterruptedException, ExecutionException, TimeoutException;
 
     /**
      * Truncates (deletes) the given table from the provided keyspace.
@@ -778,6 +778,11 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     public void setRpcTimeout(long value);
     public long getRpcTimeout();
+
+    public void setGracefulDisconnectGracePeriod(long value);
+    public long getGracefulDisconnectGracePeriod();
+
+    public boolean getGracefulDisconnectEnabled();
 
     public void setReadRpcTimeout(long value);
     public long getReadRpcTimeout();

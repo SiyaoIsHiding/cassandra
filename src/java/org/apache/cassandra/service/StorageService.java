@@ -40,13 +40,17 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -158,6 +162,7 @@ import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.Replicas;
 import org.apache.cassandra.locator.SnitchAdapter;
 import org.apache.cassandra.locator.SystemReplicas;
+import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.metrics.Sampler;
 import org.apache.cassandra.metrics.SamplingManager;
 import org.apache.cassandra.metrics.StorageMetrics;
@@ -219,7 +224,9 @@ import org.apache.cassandra.tcm.transformations.Register;
 import org.apache.cassandra.tcm.transformations.Startup;
 import org.apache.cassandra.tcm.transformations.Unregister;
 import org.apache.cassandra.transport.ClientResourceLimits;
+import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.EventMessage;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
@@ -238,6 +245,9 @@ import org.apache.cassandra.utils.progress.ProgressEventType;
 import org.apache.cassandra.utils.progress.ProgressListener;
 import org.apache.cassandra.utils.progress.jmx.JMXBroadcastExecutor;
 import org.apache.cassandra.utils.progress.jmx.JMXProgressSupport;
+
+import io.netty.channel.group.ChannelGroup;
+import io.netty.util.AttributeKey;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -292,8 +302,12 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 {
     private static final Logger logger = LoggerFactory.getLogger(StorageService.class);
 
+    private static ReentrantLock drainLock = new ReentrantLock();
+
     public static final int INDEFINITE = -1;
     public static final int RING_DELAY_MILLIS = getRingDelay(); // delay after which we assume ring has stablized
+
+    static final AttributeKey<Consumer<EventMessage>> EVENT_DISPATCHER = AttributeKey.valueOf("EVTDISP");
 
     {
         PathUtils.setDeletionListener(path -> {
@@ -617,7 +631,9 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         {
             throw new IllegalStateException("No configured daemon");
         }
-        daemon.stopNativeTransport(force);
+        gracefulDisconnect(() -> {
+            daemon.stopNativeTransport(force);
+        });
     }
 
     public boolean isNativeTransportRunning()
@@ -715,7 +731,9 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         if (daemon == null)
             throw new IllegalStateException("No configured daemon");
-        daemon.deactivate();
+        gracefulDisconnect(() -> {
+            daemon.deactivate();
+        });
     }
 
     // for testing only
@@ -1197,6 +1215,27 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public long getRpcTimeout()
     {
         return DatabaseDescriptor.getRpcTimeout(MILLISECONDS);
+    }
+
+
+    @Override
+    public boolean getGracefulDisconnectEnabled()
+    {
+        return DatabaseDescriptor.getGracefulDisconnectEnabled();
+    }
+
+    @Override
+    public void setGracefulDisconnectGracePeriod(long value)
+    {
+        if (value <= 0 && DatabaseDescriptor.getGracefulDisconnectEnabled())
+            throw new IllegalArgumentException("Graceful disconnect grace period must be positive when graceful disconnect is enabled. Got " + value);
+        DatabaseDescriptor.setGracefulDisconnectGracePeriod(value);
+    }
+
+    @Override
+    public long getGracefulDisconnectGracePeriod()
+    {
+        return DatabaseDescriptor.getGracefulDisconnectGracePeriod();
     }
 
     public void setReadRpcTimeout(long value)
@@ -3859,9 +3898,112 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     /**
      * Shuts node off to writes, empties memtables and the commit log.
      */
-    public synchronized void drain() throws IOException, InterruptedException, ExecutionException
+    public void drain() throws IOException, InterruptedException, ExecutionException, TimeoutException
     {
-        drain(false);
+        if (!drainLock.tryLock())
+        {
+            throw new IllegalStateException("Drain already in progress");
+        }
+        try
+        {
+            CountDownLatch drainComplete = new CountDownLatch(1);
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            gracefulDisconnect(() -> {
+                try
+                {
+                    drain(false);
+                }
+                catch (IOException | InterruptedException | ExecutionException e)
+                {
+                    failure.set(e);
+                }
+                finally
+                {
+                    drainComplete.countDown();
+                }
+            });
+            if (!drainComplete.await(DatabaseDescriptor.getGracefulDisconnectGracePeriod(), MILLISECONDS))
+                throw new TimeoutException("Timed out waiting for drain to complete after graceful disconnect");
+            Exception e = failure.get();
+            if (e instanceof IOException) throw (IOException) e;
+            if (e instanceof InterruptedException) throw (InterruptedException) e;
+            if (e instanceof ExecutionException) throw (ExecutionException) e;
+            if (e != null) throw new RuntimeException(e);
+        }
+        finally
+        {
+            drainLock.unlock();
+        }
+    }
+
+    private void gracefulDisconnect(Runnable defaultAction)
+    {
+        NativeTransportService nts = CassandraDaemon.instance.nativeTransportService();
+        if (nts == null || nts.getServer() == null)
+        {
+            defaultAction.run();
+            return;
+        }
+        nts.getServer().stopAcceptingNewConnections();
+        ChannelGroup channelGroup = nts.getServer().getChannelsSubscribedToGracefulDisconnect();
+        if (channelGroup == null || channelGroup.isEmpty())
+        {
+            defaultAction.run();
+            return;
+        }
+        gracefulDisconnect(defaultAction, channelGroup);
+    }
+
+    public void gracefulDisconnect(Runnable defaultAction, ChannelGroup channelGroup)
+    {
+        if (channelGroup == null || channelGroup.isEmpty())
+        {
+            defaultAction.run();
+            return;
+        }
+        AtomicBoolean actionStarted = new AtomicBoolean(false);
+        AtomicInteger connectedChannels = new AtomicInteger(channelGroup.size());
+        Runnable runOnceAction = () -> {
+            if (actionStarted.compareAndSet(false, true))
+                defaultAction.run();
+        };
+        Runnable onTimeout = () -> {
+            if (actionStarted.get())
+                return;
+            int remaining = connectedChannels.get();
+            if (remaining > 0)
+            {
+                ClientMetrics.instance.markForcedDisconnect(remaining);
+                channelGroup.close();
+            }
+            else
+            {
+                runOnceAction.run();
+            }
+        };
+        ScheduledFuture<?> timeoutTask = ScheduledExecutors.nonPeriodicTasks
+                                         .schedule(onTimeout, DatabaseDescriptor.getGracefulDisconnectGracePeriod(), MILLISECONDS);
+        EventMessage gracefulDisconnectEventMessage = new EventMessage(new Event.GracefulDisconnect());
+        channelGroup.forEach(channel -> {
+            Consumer<EventMessage> dispatcher = channel.attr(EVENT_DISPATCHER).get();
+            if (dispatcher != null)
+                dispatcher.accept(gracefulDisconnectEventMessage);
+
+            channel.closeFuture().addListener(future -> {
+                ClientMetrics.instance.decrementConnectionsDraining();
+                if (connectedChannels.decrementAndGet() == 0)
+                {
+                    timeoutTask.cancel(false);
+                    runOnceAction.run();
+                }
+            });
+            ClientMetrics.instance.incrementConnectionsDraining();
+        });
+        if (connectedChannels.get() == 0)
+        {
+            timeoutTask.cancel(false);
+            runOnceAction.run();
+        }
     }
 
     protected synchronized void drain(boolean isFinalShutdown) throws IOException, InterruptedException, ExecutionException
