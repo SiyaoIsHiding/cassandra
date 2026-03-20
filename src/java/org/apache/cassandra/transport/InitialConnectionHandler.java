@@ -86,10 +86,15 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                     // LZ4 is always available since worst case scenario it default to a pure JAVA implem.
                     compressions.add("lz4");
 
+                    List<String> gracefulDisconnect = new ArrayList<String>();
+                    gracefulDisconnect.add("true");
+
                     Map<String, List<String>> supportedOptions = new HashMap<>();
                     supportedOptions.put(StartupMessage.CQL_VERSION, cqlVersions);
                     supportedOptions.put(StartupMessage.COMPRESSION, compressions);
                     supportedOptions.put(StartupMessage.PROTOCOL_VERSIONS, ProtocolVersion.supportedVersions());
+                    //TODO: what's the diff between this v.s. OptionsMessage.execute??
+                    supportedOptions.put(StartupMessage.GRACEFUL_DISCONNECT, gracefulDisconnect);
                     SupportedMessage supported = new SupportedMessage(supportedOptions);
                     supported.setStreamId(inbound.header.streamId);
                     outbound = supported.encode(inbound.header.version);

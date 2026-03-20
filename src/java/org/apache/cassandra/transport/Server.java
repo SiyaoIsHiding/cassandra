@@ -200,6 +200,11 @@ public class Server implements CassandraDaemon.Server
 
     private void close(boolean force)
     {
+        if (!force){
+            connectionTracker.send(Event.GracefulDisconnect.instance);
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5000));
+        }
+
         if (!force)
         {
             long deadline = nanoTime() + DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS);

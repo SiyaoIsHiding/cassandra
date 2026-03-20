@@ -70,10 +70,14 @@ public class OptionsMessage extends Message.Request
         // LZ4 is always available since worst case scenario it default to a pure JAVA implem.
         compressions.add("lz4");
 
+        List<String> gracefulDisconnect = new ArrayList<String>();
+        gracefulDisconnect.add("true");
+
         Map<String, List<String>> supported = new HashMap<String, List<String>>();
         supported.put(StartupMessage.CQL_VERSION, cqlVersions);
         supported.put(StartupMessage.COMPRESSION, compressions);
         supported.put(StartupMessage.PROTOCOL_VERSIONS, ProtocolVersion.supportedVersions());
+        supported.put(StartupMessage.GRACEFUL_DISCONNECT, gracefulDisconnect);
 
         return new SupportedMessage(supported);
     }
