@@ -33,6 +33,7 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,6 +45,7 @@ import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaChangeListener;
@@ -80,6 +82,7 @@ public class Server implements CassandraDaemon.Server
     private static final boolean useEpoll = NativeTransportService.useEpoll();
 
     private final ConnectionTracker connectionTracker;
+    private Channel bindChannel;
 
     private final Connection.Factory connectionFactory = new Connection.Factory()
     {
@@ -126,6 +129,11 @@ public class Server implements CassandraDaemon.Server
         Schema.instance.registerListener(notifier);
     }
 
+    public ChannelGroup getChannelsSubscribedToGracefulDisconnect()
+    {
+        return connectionTracker.groups.get(Event.Type.GRACEFUL_DISCONNECT);
+    }
+
     public void stop()
     {
         stop(false);
@@ -133,8 +141,47 @@ public class Server implements CassandraDaemon.Server
 
     public void stop(boolean force)
     {
-         if (isRunning.compareAndSet(true, false))
-             close(force);
+        if (isRunning.compareAndSet(true, false))
+            close(force);
+    }
+
+    private void gracefulDisconnect()
+    {
+        stopAcceptingNewConnections();
+
+        ChannelGroup draining = getChannelsSubscribedToGracefulDisconnect();
+        ClientMetrics.instance.connectionsDraining.set(draining.size());
+        draining.forEach(channel ->
+            channel.closeFuture().addListener(future -> ClientMetrics.instance.decrementConnectionsDraining()));
+
+        connectionTracker.send(new Event.GracefulDisconnect());
+
+        int forcedDisconnects = awaitGracefulDisconnect(draining, DatabaseDescriptor.getGracefulDisconnectGracePeriod());
+        if (forcedDisconnects > 0)
+            logger.warn("Graceful disconnect grace period expired with {} client(s) still connected; forcing disconnect", forcedDisconnects);
+        ClientMetrics.instance.markForcedDisconnect(forcedDisconnects);
+    }
+
+    /**
+     * Waits for all channels in {@code channels} to close on their own (e.g. in response to a
+     * {@link Event.GracefulDisconnect}) up to {@code gracePeriodMillis}, then force-closes whatever
+     * is left. {@link io.netty.channel.group.DefaultChannelGroup} removes a channel from itself as
+     * soon as it closes, so {@code channels.size()} after the wait is exactly the count still open.
+     *
+     * @return the number of channels that had to be force-closed
+     */
+    @VisibleForTesting
+    static int awaitGracefulDisconnect(ChannelGroup channels, long gracePeriodMillis)
+    {
+        if (channels.isEmpty())
+            return 0;
+
+        if (channels.newCloseFuture().awaitUninterruptibly(gracePeriodMillis, TimeUnit.MILLISECONDS))
+            return 0;
+
+        int stillOpen = channels.size();
+        channels.close();
+        return stillOpen;
     }
 
     public boolean isRunning()
@@ -149,12 +196,28 @@ public class Server implements CassandraDaemon.Server
 
         // Configure the server.
         ChannelFuture bindFuture = pipelineConfigurator.initializeChannel(workerGroup, socket, connectionFactory);
+        bindChannel = bindFuture.channel();
         if (!bindFuture.awaitUninterruptibly().isSuccess())
             throw new IllegalStateException(String.format("Failed to bind port %d on %s.", socket.getPort(), socket.getAddress().getHostAddress()),
                                             bindFuture.cause());
 
         connectionTracker.allChannels.add(bindFuture.channel());
         isRunning.set(true);
+    }
+
+    /**
+     * Permanently stops the native transport acceptor from accepting new connections.
+     * This does NOT reopen on its own — a full native transport restart is required
+     * to accept new connections again after this is called.
+     */
+    public void stopAcceptingNewConnections()
+    {
+        if (bindChannel != null && bindChannel.isOpen())
+        {
+            logger.info("Stopping native transport acceptor on {}", bindChannel.localAddress());
+            // syncUninterruptibly ensures we wait for the port to actually close
+            bindChannel.close().syncUninterruptibly();
+        }
     }
 
     public int countConnectedClients()
@@ -202,6 +265,9 @@ public class Server implements CassandraDaemon.Server
     {
         if (!force)
         {
+            if (DatabaseDescriptor.getGracefulDisconnectEnabled())
+                gracefulDisconnect();
+
             long deadline = nanoTime() + DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS);
             while (!dispatcher.isDone())
             {
@@ -330,6 +396,8 @@ public class Server implements CassandraDaemon.Server
 
         public void register(Event.Type type, Channel ch)
         {
+            if (type == Event.Type.GRACEFUL_DISCONNECT && !DatabaseDescriptor.getGracefulDisconnectEnabled())
+                return;
             groups.get(type).add(ch);
         }
 

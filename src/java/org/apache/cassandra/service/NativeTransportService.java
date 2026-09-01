@@ -37,6 +37,7 @@ import org.apache.cassandra.utils.NativeLibrary;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.epoll.Epoll;
 import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.util.Version;
 
@@ -161,6 +162,18 @@ public class NativeTransportService
     Server getServer()
     {
         return server;
+    }
+
+    /**
+     * Exposed for {@code GracefulDisconnectTest} (a distributed dtest, so this must stay public rather
+     * than package-private like {@link #getServer()}/{@link #getWorkerGroup()}). No production caller —
+     * {@link org.apache.cassandra.transport.Server#gracefulDisconnect()} calls the equivalent method on
+     * its own {@code Server} instance directly.
+     */
+    @VisibleForTesting
+    public ChannelGroup getChannelsSubscribedToGracefulDisconnect()
+    {
+        return server.getChannelsSubscribedToGracefulDisconnect();
     }
 
     public void clearConnectionHistory()
