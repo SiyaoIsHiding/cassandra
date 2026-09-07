@@ -95,6 +95,11 @@ public class Server implements CassandraDaemon.Server
     public final InetSocketAddress socket;
     public final EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy;
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
+    // Gates request dispatch, separately from isRunning: isRunning flips to false the instant stop()
+    // is called (reentrancy guard + public status), but acceptingRequests stays true through the whole
+    // graceful-disconnect grace period, so requests keep being served normally on already-open
+    // connections until the grace period actually elapses (or every subscribed client closes early).
+    private final AtomicBoolean acceptingRequests = new AtomicBoolean(false);
     private final PipelineConfigurator pipelineConfigurator;
     private final EventLoopGroup workerGroup;
     private final Dispatcher dispatcher;
@@ -123,7 +128,7 @@ public class Server implements CassandraDaemon.Server
                                                           dispatcher);
 
         EventNotifier notifier = builder.eventNotifier != null ? builder.eventNotifier : new EventNotifier();
-        connectionTracker = new ConnectionTracker(isRunning::get);
+        connectionTracker = new ConnectionTracker(acceptingRequests::get);
         notifier.registerConnectionTracker(connectionTracker);
         StorageService.instance.register(notifier);
         Schema.instance.registerListener(notifier);
@@ -203,6 +208,7 @@ public class Server implements CassandraDaemon.Server
 
         connectionTracker.allChannels.add(bindFuture.channel());
         isRunning.set(true);
+        acceptingRequests.set(true);
     }
 
     /**
@@ -266,7 +272,12 @@ public class Server implements CassandraDaemon.Server
         if (!force)
         {
             if (DatabaseDescriptor.getGracefulDisconnectEnabled())
-                gracefulDisconnect();
+                gracefulDisconnect(); // acceptingRequests stays true throughout, so requests keep dispatching normally
+            else
+                stopAcceptingNewConnections();
+
+            // Only now, with the grace period (if any) spent, do we cut off new request dispatch.
+            acceptingRequests.set(false);
 
             long deadline = nanoTime() + DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS);
             while (!dispatcher.isDone())
@@ -278,6 +289,11 @@ public class Server implements CassandraDaemon.Server
                 }
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(100));
             }
+        }
+        else
+        {
+            stopAcceptingNewConnections();
+            acceptingRequests.set(false);
         }
 
         // Close opened connections

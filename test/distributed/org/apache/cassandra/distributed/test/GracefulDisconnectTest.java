@@ -20,24 +20,31 @@ package org.apache.cassandra.distributed.test;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import org.awaitility.Awaitility;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.distributed.Cluster;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
+import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.service.CassandraDaemon;
 import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.SimpleClient;
 import org.apache.cassandra.transport.messages.OptionsMessage;
+import org.apache.cassandra.transport.messages.QueryMessage;
 import org.apache.cassandra.transport.messages.ReadyMessage;
 import org.apache.cassandra.transport.messages.RegisterMessage;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.transport.messages.StartupMessage;
 import org.apache.cassandra.transport.messages.SupportedMessage;
 
@@ -329,6 +336,227 @@ public class GracefulDisconnectTest
                 org.apache.cassandra.metrics.ClientMetrics.instance.forcedDisconnects.getCount()
             );
             assertThat(forcedCount).as("ForcedDisconnects metric should be 0 for a cooperative client").isEqualTo(0);
+        }
+    }
+
+    // Grace period for the multi-node tests below.
+    private static final String GRACE_PERIOD = "4s";
+
+    private Cluster buildMultiNodeCluster(int nodeCount, boolean gracefulDisconnectEnabled) throws IOException
+    {
+        Cluster cluster = Cluster.build(nodeCount)
+                                  .withConfig(config ->
+                                              config.with(Feature.NATIVE_PROTOCOL, Feature.GOSSIP, Feature.NETWORK)
+                                                    .set("graceful_disconnect_enabled", gracefulDisconnectEnabled)
+                                                    .set("graceful_disconnect_grace_period", GRACE_PERIOD))
+                                  .start();
+        cluster.schemaChange("CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': " + nodeCount + '}');
+        cluster.schemaChange("CREATE TABLE ks.tbl (id int PRIMARY KEY, val text)");
+        // A coordinated write at CL.ALL, unlike executeInternal (which only writes to node 1's local
+        // storage), actually replicates to every node - required since otherClient below reads from a
+        // different node than the one being drained.
+        cluster.coordinator(1).execute("INSERT INTO ks.tbl (id, val) VALUES (1, 'test_val')", ConsistencyLevel.ALL);
+        return cluster;
+    }
+
+    private static String selectVal(SimpleClient client)
+    {
+        Message.Response response = client.execute(new QueryMessage(
+        "SELECT val FROM ks.tbl WHERE id = 1",
+        QueryOptions.DEFAULT));
+        ResultMessage.Rows rows = (ResultMessage.Rows) response;
+        return new String(rows.result.rows.get(0).get(0), StandardCharsets.UTF_8);
+    }
+
+    @Test
+    public void testGracefulDisconnectAllowsInFlightAndOtherNodesToProceed() throws Exception
+    {
+        try (Cluster cluster = buildMultiNodeCluster(3, true))
+        {
+            InetSocketAddress drainingAddr = cluster.get(1).config().broadcastAddress();
+            InetSocketAddress otherAddr = cluster.get(2).config().broadcastAddress();
+
+            // Registered, but deliberately does not close itself on receiving the event - so the only
+            // thing keeping its connection alive (and serving requests) is the server's grace period,
+            // not client cooperation. That isolates exactly what this test is about: contrast with
+            // testWithoutGracefulDisconnectConnectionDiesWithoutWarning, which probes an identically-
+            // registered connection with the feature off.
+            try (SimpleClient drainingClient = SimpleClient.builder(drainingAddr.getHostString(), 9042)
+                                                            .protocolVersion(ProtocolVersion.V5)
+                                                            .ignoreGracefulDisconnect()
+                                                            .build();
+                 SimpleClient otherClient = SimpleClient.builder(otherAddr.getHostString(), 9042)
+                                                        .protocolVersion(ProtocolVersion.V5)
+                                                        .build())
+            {
+                drainingClient.connect(false);
+                drainingClient.execute(new RegisterMessage(Collections.singletonList(Event.Type.GRACEFUL_DISCONNECT)));
+                otherClient.connect(false);
+
+                CompletableFuture<Void> drainFuture = CompletableFuture.runAsync(() ->
+                    cluster.get(1).nodetoolResult("drain").asserts().success()
+                );
+
+                // Wait for native transport shutdown to actually begin, rather than guessing how long
+                // drain's earlier steps (batchlog/snapshot/hints shutdown) take on this machine - that
+                // preamble has no fixed bound and is exactly what makes a flat sleep flaky under CI load.
+                // isRunning() flips to false the instant Server.stop() is entered, before any graceful-
+                // disconnect-specific branching, so this fires identically whether the feature is on or
+                // off - it only tells us the preamble is done, not which path we're on.
+                Awaitility.await()
+                          .atMost(15, TimeUnit.SECONDS)
+                          .until(() -> !cluster.get(1).callOnInstance(() ->
+                              CassandraDaemon.getInstanceForTesting().nativeTransportService().isRunning()));
+
+                // A short, fixed buffer for the handful of fast, CPU-bound steps that run between
+                // isRunning() flipping and the disabled path's immediate connectionTracker.closeAll()
+                // (closing the bind channel, an idle dispatcher check). Unlike the preamble above, these
+                // don't depend on unpredictable background work, so a small constant safely covers them
+                // on any machine while barely denting the 4-second grace period's margin on this path.
+                Thread.sleep(500);
+
+                // With native transport shutdown confirmed underway, a request made now is not merely
+                // rejected cleanly - it is processed normally, because the grace period is still running.
+                // That is the actual value graceful disconnect buys you. If this were run with the feature
+                // disabled (see testWithoutGracefulDisconnectConnectionDiesWithoutWarning, or flip the flag
+                // above to false), the connection would already be gone by now and this call would fail
+                // with a timeout instead of returning a value.
+                assertThat(selectVal(drainingClient))
+                .as("a request made mid-drain is processed normally, not rejected")
+                .isEqualTo("test_val");
+
+                assertThat(selectVal(otherClient)).isEqualTo("test_val");
+
+                drainFuture.get(30, TimeUnit.SECONDS);
+
+                // Once the full grace period elapses, a connection that never cooperated is force-closed -
+                // but only after remaining usable for the whole window probed above.
+                assertThat(drainingClient.isConnected())
+                .as("the connection is force-closed once the grace period runs out")
+                .isFalse();
+
+                // Other nodes keep working after the drain completes too.
+                assertThat(selectVal(otherClient)).isEqualTo("test_val");
+            }
+        }
+    }
+
+    @Test
+    public void testWithoutGracefulDisconnectQueryFails() throws Exception
+    {
+        try (Cluster cluster = buildMultiNodeCluster(3, false))
+        {
+            InetSocketAddress drainingAddr = cluster.get(1).config().broadcastAddress();
+            InetSocketAddress otherAddr = cluster.get(2).config().broadcastAddress();
+
+            // Registered, but deliberately does not close itself on receiving the event - so the only
+            // thing keeping its connection alive (and serving requests) is the server's grace period,
+            // not client cooperation. That isolates exactly what this test is about: contrast with
+            // testWithoutGracefulDisconnectConnectionDiesWithoutWarning, which probes an identically-
+            // registered connection with the feature off.
+            try (SimpleClient drainingClient = SimpleClient.builder(drainingAddr.getHostString(), 9042)
+                                                           .protocolVersion(ProtocolVersion.V5)
+                                                           .ignoreGracefulDisconnect()
+                                                           .build();
+                 SimpleClient otherClient = SimpleClient.builder(otherAddr.getHostString(), 9042)
+                                                        .protocolVersion(ProtocolVersion.V5)
+                                                        .build())
+            {
+                drainingClient.connect(false);
+                otherClient.connect(false);
+
+                CompletableFuture<Void> drainFuture = CompletableFuture.runAsync(() ->
+                                                                                 cluster.get(1).nodetoolResult("drain").asserts().success()
+                );
+
+                // Wait for native transport shutdown to actually begin, rather than guessing how long
+                // drain's earlier steps (batchlog/snapshot/hints shutdown) take on this machine - that
+                // preamble has no fixed bound and is exactly what makes a flat sleep flaky under CI load.
+                // isRunning() flips to false the instant Server.stop() is entered, before any graceful-
+                // disconnect-specific branching, so this fires identically whether the feature is on or
+                // off - it only tells us the preamble is done, not which path we're on.
+                Awaitility.await()
+                          .atMost(15, TimeUnit.SECONDS)
+                          .until(() -> !cluster.get(1).callOnInstance(() ->
+                                                                      CassandraDaemon.getInstanceForTesting().nativeTransportService().isRunning()));
+
+                // A short, fixed buffer for the handful of fast, CPU-bound steps that run between
+                // isRunning() flipping and the disabled path's immediate connectionTracker.closeAll()
+                // (closing the bind channel, an idle dispatcher check). Unlike the preamble above, these
+                // don't depend on unpredictable background work, so a small constant safely covers them
+                // on any machine while barely denting the 4-second grace period's margin on this path.
+                Thread.sleep(500);
+
+                assertThatThrownBy(() -> selectVal(drainingClient))
+                .as("without graceful disconnect, query should timeout")
+                .hasMessage("timeout");
+
+                assertThat(selectVal(otherClient)).isEqualTo("test_val");
+
+                drainFuture.get(30, TimeUnit.SECONDS);
+
+                // Once the full grace period elapses, a connection that never cooperated is force-closed -
+                // but only after remaining usable for the whole window probed above.
+                assertThat(drainingClient.isConnected())
+                .as("the connection is force-closed once the grace period runs out")
+                .isFalse();
+
+                // Other nodes keep working after the drain completes too.
+                assertThat(selectVal(otherClient)).isEqualTo("test_val");
+            }
+        }
+    }
+
+    @Test
+    public void testUncooperativeClientIsCountedDrainingThenForceDisconnected() throws Exception
+    {
+        try (Cluster cluster = Cluster.build(1)
+                                      .withConfig(config ->
+                                                  config.with(Feature.NATIVE_PROTOCOL, Feature.GOSSIP)
+                                                        .set("graceful_disconnect_enabled", true)
+                                                        .set("graceful_disconnect_grace_period", "2s"))
+                                      .start())
+        {
+            InetSocketAddress nativeAddr = cluster.get(1).config().broadcastAddress();
+
+            long baselineForced = cluster.get(1).callOnInstance(() ->
+                ClientMetrics.instance.forcedDisconnects.getCount()
+            );
+
+            // A client that registers for GRACEFUL_DISCONNECT but ignores it instead of closing its own
+            // channel, simulating a driver that never implemented the cooperative-close contract.
+            try (SimpleClient client = SimpleClient.builder(nativeAddr.getHostString(), 9042)
+                                                   .protocolVersion(ProtocolVersion.V5)
+                                                   .ignoreGracefulDisconnect()
+                                                   .build())
+            {
+                client.connect(false);
+                client.execute(new RegisterMessage(Collections.singletonList(Event.Type.GRACEFUL_DISCONNECT)));
+
+                CompletableFuture<Void> drainFuture = CompletableFuture.runAsync(() -> {
+                    cluster.get(1).nodetool("drain");
+                });
+
+                // While the grace period is running, the still-open connection must be reflected as draining.
+                Awaitility.await()
+                          .atMost(2, TimeUnit.SECONDS)
+                          .until(() -> cluster.get(1).callOnInstance(() ->
+                              ClientMetrics.instance.connectionsDraining.get()) == 1);
+
+                drainFuture.get(10, TimeUnit.SECONDS);
+
+                int draining = cluster.get(1).callOnInstance(() ->
+                    ClientMetrics.instance.connectionsDraining.get()
+                );
+                assertThat(draining).as("connectionsDraining should settle back to 0 once force-closed").isEqualTo(0);
+
+                long forcedCount = cluster.get(1).callOnInstance(() ->
+                    ClientMetrics.instance.forcedDisconnects.getCount()
+                );
+                assertThat(forcedCount)
+                .as("ForcedDisconnects metric should count the uncooperative client")
+                .isEqualTo(baselineForced + 1);
+            }
         }
     }
 }

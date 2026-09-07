@@ -108,6 +108,9 @@ public class SimpleClient implements Closeable
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private final EncryptionOptions.ClientEncryptionOptions encryptionOptions;
     private final int largeMessageThreshold;
+    // Test-only: simulates an uncooperative client that ignores GRACEFUL_DISCONNECT instead of closing
+    // its channel, so the server is forced to close it once the grace period expires.
+    private final boolean ignoreGracefulDisconnect;
     // We don't track connection really, so we don't need one Connection per channel
     protected Connection connection;
     protected Bootstrap bootstrap;
@@ -122,6 +125,7 @@ public class SimpleClient implements Closeable
         this.version = builder.version;
         this.encryptionOptions = builder.encryptionOptions.applyConfig();
         this.largeMessageThreshold = builder.largeMessageThreshold;
+        this.ignoreGracefulDisconnect = builder.ignoreGracefulDisconnect;
     }
 
     public SimpleClient(String host, int port, ProtocolVersion version, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
@@ -149,6 +153,7 @@ public class SimpleClient implements Closeable
         this.version = version;
         this.encryptionOptions = encryptionOptions.applyConfig();
         this.largeMessageThreshold = FrameEncoder.Payload.MAX_SIZE - Math.max(FrameEncoderCrc.HEADER_AND_TRAILER_LENGTH, FrameEncoderLZ4.HEADER_AND_TRAILER_LENGTH);
+        this.ignoreGracefulDisconnect = false;
     }
 
     public SimpleClient(String host, int port)
@@ -194,6 +199,24 @@ public class SimpleClient implements Closeable
         }
         execute(new StartupMessage(options));
         return this;
+    }
+
+    /**
+     * @return true once this client has received a {@code GRACEFUL_DISCONNECT} event and is closing
+     * (or has closed) its connection in response - i.e. it was warned before the connection died.
+     */
+    public boolean isDraining()
+    {
+        return draining.get();
+    }
+
+    /**
+     * @return true if the underlying channel is still open. False both when this client closed it
+     * cooperatively (after {@link #isDraining()}) and when the server severed it without warning.
+     */
+    public boolean isConnected()
+    {
+        return channel != null && channel.isOpen();
     }
 
     public void setEventHandler(EventHandler eventHandler)
@@ -357,6 +380,7 @@ public class SimpleClient implements Closeable
         private ProtocolVersion version = ProtocolVersion.CURRENT;
         private boolean useBeta = false;
         private int largeMessageThreshold = FrameEncoder.Payload.MAX_SIZE;
+        private boolean ignoreGracefulDisconnect = false;
 
         private Builder(String host, int port)
         {
@@ -385,6 +409,17 @@ public class SimpleClient implements Closeable
         public Builder largeMessageThreshold(int bytes)
         {
             largeMessageThreshold = bytes;
+            return this;
+        }
+
+        /**
+         * Test-only: makes the built client ignore any {@code GRACEFUL_DISCONNECT} event instead of
+         * closing its channel in response, simulating an uncooperative client that has to be
+         * force-disconnected once the server's grace period expires.
+         */
+        public Builder ignoreGracefulDisconnect()
+        {
+            ignoreGracefulDisconnect = true;
             return this;
         }
 
@@ -674,7 +709,8 @@ public class SimpleClient implements Closeable
                     {
                         logger.info("Received GRACEFUL_DISCONNECT. Entering draining mode.");
                         if (eventHandler != null) eventHandler.onEvent(event);
-                        client.handleGracefulDisconnect();
+                        if (!client.ignoreGracefulDisconnect)
+                            client.handleGracefulDisconnect();
                         return;
                     }
 
