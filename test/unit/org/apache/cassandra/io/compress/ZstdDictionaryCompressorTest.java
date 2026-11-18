@@ -23,9 +23,14 @@ import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import com.github.luben.zstd.Zstd;
 import com.github.luben.zstd.ZstdDictTrainer;
+import com.google.common.collect.ImmutableMap;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -33,6 +38,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compression.ZstdCompressionDictionary;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 import static org.apache.cassandra.db.compression.CompressionDictionary.DictId;
 import static org.apache.cassandra.db.compression.CompressionDictionary.Kind;
@@ -73,6 +79,44 @@ public class ZstdDictionaryCompressorTest
         {
             testDictionary.close();
         }
+    }
+
+    /**
+     * A compressor with no dictionary yet - the state every dictionary-compressed table is in until one is trained -
+     * falls through to the implementations inherited from ZstdCompressorBase, so it must pool native contexts just
+     * as the plain compressor does. This is why the pooling lives in the base rather than in ZstdCompressor.
+     */
+    @Test
+    public void dictionarylessCompressorPoolsNativeContexts() throws Exception
+    {
+        // a level of its own, so the per-level cached instance is not one another test has already exercised
+        ZstdDictionaryCompressor compressor =
+            ZstdDictionaryCompressor.create(ImmutableMap.of(ZstdCompressorBase.COMPRESSION_LEVEL_OPTION_NAME, "11"));
+
+        assertThat(compressor.pooledCompressContexts()).describedAs("no context before the first chunk").isZero();
+        assertThat(compressor.pooledDecompressContexts()).isZero();
+
+        for (int i = 0; i < 16; i++)
+        {
+            ByteBuffer input = ByteBuffer.allocateDirect(compressibleData.length);
+            input.put(compressibleData);
+            input.flip();
+
+            ByteBuffer compressed = ByteBuffer.allocateDirect(compressor.initialCompressedBufferLength(compressibleData.length));
+            compressor.compress(input, compressed);
+            compressed.flip();
+
+            ByteBuffer decompressed = ByteBuffer.allocateDirect(compressibleData.length);
+            compressor.uncompress(compressed, decompressed);
+            decompressed.flip();
+
+            byte[] result = new byte[decompressed.remaining()];
+            decompressed.get(result);
+            assertThat(result).isEqualTo(compressibleData);
+        }
+
+        assertThat(compressor.pooledCompressContexts()).describedAs("one compression context, reused").isEqualTo(1);
+        assertThat(compressor.pooledDecompressContexts()).describedAs("one decompression context, reused").isEqualTo(1);
     }
 
     @Test
@@ -281,14 +325,138 @@ public class ZstdDictionaryCompressorTest
     @Test
     public void testClosedDictionaryHandling()
     {
-        ZstdDictionaryCompressor.invalidateCache();
         ZstdCompressionDictionary closedDict = createTestDictionary();
         closedDict.initRefLazily();
         closedDict.close();
 
-        // This should throw IllegalStateException
-        assertThatThrownBy(() -> ZstdDictionaryCompressor.create(closedDict))
-        .isInstanceOf(IllegalStateException.class);
+        // create() does not check the dictionary is released - only compressing or decompressing with it does
+        ZstdDictionaryCompressor compressor = ZstdDictionaryCompressor.create(closedDict);
+
+        ByteBuffer input = ByteBuffer.allocateDirect(compressibleData.length);
+        input.put(compressibleData);
+        input.flip();
+        ByteBuffer compressed = ByteBuffer.allocateDirect(compressor.initialCompressedBufferLength(compressibleData.length));
+        assertThatThrownBy(() -> compressor.compress(input, compressed))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("Dictionary is released");
+    }
+
+    /**
+     * Races a concurrent release of the dictionary's last reference against in-flight compress/uncompress calls to
+     * guard the fix: each call must hold its own ref for the native call's duration, or the release can tidy the
+     * dictionary out from under it.
+     */
+    @Test
+    public void testConcurrentCompressSurvivesConcurrentEviction() throws Exception
+    {
+        ZstdCompressionDictionary dictionary = createTestDictionary(9001);
+        ZstdDictionaryCompressor compressor = ZstdDictionaryCompressor.create(dictionary);
+        // An extra ref the test holds and releases concurrently with the workers below, simulating the production
+        // trigger where the last reference is released while a compress/uncompress call is in flight.
+        Ref<ZstdCompressionDictionary> ref = dictionary.tryRef();
+        dictionary.close();
+
+        int workerCount = 4;
+        int iterationsPerWorker = 1000;
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+        try
+        {
+            Future<?>[] futures = new Future[workerCount];
+            for (int w = 0; w < workerCount; w++)
+            {
+                futures[w] = executor.submit(() -> {
+                    for (int i = 0; i < iterationsPerWorker; i++)
+                    {
+                        ByteBuffer input = ByteBuffer.allocateDirect(compressibleData.length);
+                        input.put(compressibleData);
+                        input.flip();
+                        ByteBuffer compressed =
+                            ByteBuffer.allocateDirect(compressor.initialCompressedBufferLength(compressibleData.length));
+                        ByteBuffer decompressed = ByteBuffer.allocateDirect(compressibleData.length);
+                        try
+                        {
+                            compressor.compress(input, compressed);
+                            compressed.flip();
+                            compressor.uncompress(compressed, decompressed);
+                            decompressed.flip();
+
+                            byte[] result = new byte[decompressed.remaining()];
+                            decompressed.get(result);
+                            assertThat(result)
+                            .as("round trip must never return corrupt data, even racing dictionary release")
+                            .isEqualTo(compressibleData);
+                        }
+                        catch (IOException e)
+                        {
+                            // Once the dictionary is fully released, the fix fails fast here instead of handing
+                            // out a context loaded with freed native memory - a safe terminal state.
+                            if (e.getMessage() != null && e.getMessage().contains("Dictionary is released"))
+                                return;
+                            throw new RuntimeException(e);
+                        }
+                    }
+                });
+            }
+
+            // Force the exact path production hits: releasing the last reference while the workers above are
+            // still racing through compress/uncompress calls.
+            ref.release();
+
+            for (Future<?> future : futures)
+                future.get(10, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Two different dictionary objects sharing the same dictId - e.g. the same dictionary loaded twice, as the
+     * dictionary cache does on eviction and reload - must get independent compressors, each bound to the object it
+     * was created for. Neither object's compressor is affected by the other object's lifecycle.
+     */
+    @Test
+    public void equalDictionary() throws IOException
+    {
+        ZstdCompressionDictionary first = createTestDictionary(9002);
+        ZstdDictionaryCompressor firstCompressor = ZstdDictionaryCompressor.create(first);
+
+        ZstdCompressionDictionary second = new ZstdCompressionDictionary(first.dictId(), first.rawDictionary());
+        Ref<ZstdCompressionDictionary> ref = second.tryRef();
+        try
+        {
+            ZstdDictionaryCompressor secondCompressor = ZstdDictionaryCompressor.create(second);
+
+            assertThat(secondCompressor)
+            .as("a different dictionary object must get its own compressor, not the other object's")
+            .isNotSameAs(firstCompressor);
+            assertThat(secondCompressor.dictionary()).isSameAs(second);
+            assertThat(firstCompressor.dictionary()).isSameAs(first);
+
+            // closing the first object does not affect the second object's compressor
+            first.close();
+
+            ByteBuffer input = ByteBuffer.allocateDirect(compressibleData.length);
+            input.put(compressibleData);
+            input.flip();
+            ByteBuffer compressed = ByteBuffer.allocateDirect(secondCompressor.initialCompressedBufferLength(compressibleData.length));
+            secondCompressor.compress(input, compressed);
+            compressed.flip();
+            ByteBuffer decompressed = ByteBuffer.allocateDirect(compressibleData.length);
+            secondCompressor.uncompress(compressed, decompressed);
+            decompressed.flip();
+
+            byte[] result = new byte[decompressed.remaining()];
+            decompressed.get(result);
+            assertThat(result).isEqualTo(compressibleData);
+        }
+        finally
+        {
+            ref.release();
+            second.close();
+        }
     }
 
     @Test
@@ -370,6 +538,11 @@ public class ZstdDictionaryCompressorTest
 
     private static ZstdCompressionDictionary createTestDictionary()
     {
+        return createTestDictionary(1);
+    }
+
+    private static ZstdCompressionDictionary createTestDictionary(long id)
+    {
         try
         {
             int sampleSize = 100 * 1024;
@@ -383,7 +556,7 @@ public class ZstdDictionaryCompressorTest
             }
 
             byte[] dictBytes = trainer.trainSamples();
-            DictId dictId = new DictId(Kind.ZSTD, 1);
+            DictId dictId = new DictId(Kind.ZSTD, id);
 
             return new ZstdCompressionDictionary(dictId, dictBytes);
         }

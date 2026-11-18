@@ -33,11 +33,11 @@ import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.nodetool.layout.CassandraUsage;
 
-import picocli.CommandLine.ArgGroup;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static org.apache.cassandra.tcm.CMSOperations.CMS_ID;
 import static org.apache.cassandra.tcm.CMSOperations.COMMITS_PAUSED;
 import static org.apache.cassandra.tcm.CMSOperations.EPOCH;
@@ -123,6 +123,13 @@ public class CMSAdmin extends AbstractCommand
                 description = "Cancels any in progress CMS reconfiguration")
         private boolean cancel = false;
 
+        @Option(paramLabel = "ignored_endpoints",
+                names = { "-i", "--ignore" },
+                description = "Hosts to exclude from the new CMS, in addition to any which are currently down. Useful " +
+                              "before shrinking a cluster: excluding the nodes which are about to be decommissioned " +
+                              "keeps the CMS membership stable, avoiding a reconfiguration per decommissioned member.")
+        private List<String> ignoredEndpoints = new ArrayList<>();
+
         @CassandraUsage(usage = "[<replication factor>] or <datacenter>:<replication_factor> ... ", description = "Replication factor of new CMS")
         @Parameters(paramLabel = "replication_factor", description = "Replication factors of new CMS in format <replication factor> or <datacenter>:<replication_factor>")
         private List<String> args = new ArrayList<>();
@@ -148,6 +155,8 @@ public class CMSAdmin extends AbstractCommand
             {
                 if (!args.isEmpty())
                     throw new IllegalArgumentException("Replication factor should not be set if previous operation is resumed");
+                if (!ignoredEndpoints.isEmpty())
+                    throw new IllegalArgumentException("Ignored hosts should not be set if previous operation is resumed");
 
                 probe.getCMSOperationsProxy().resumeReconfigureCms();
                 return;
@@ -155,6 +164,9 @@ public class CMSAdmin extends AbstractCommand
 
             if (cancel)
             {
+                if (!ignoredEndpoints.isEmpty())
+                    throw new IllegalArgumentException("Ignored hosts should not be set when cancelling a reconfiguration");
+
                 probe.getCMSOperationsProxy().cancelReconfigureCms();
                 return;
             }
@@ -178,7 +190,7 @@ public class CMSAdmin extends AbstractCommand
                     {
                         throw new IllegalArgumentException(String.format("Can not parse replication factor from %s", args.get(0)));
                     }
-                    probe.getCMSOperationsProxy().reconfigureCMS(parsedRf);
+                    probe.getCMSOperationsProxy().reconfigureCMS(parsedRf, ignoredEndpoints);
                     return;
                 }
                 else
@@ -200,7 +212,7 @@ public class CMSAdmin extends AbstractCommand
                 }
             }
 
-            probe.getCMSOperationsProxy().reconfigureCMS(parsedRfs);
+            probe.getCMSOperationsProxy().reconfigureCMS(parsedRfs, ignoredEndpoints);
         }
     }
 
@@ -303,41 +315,30 @@ public class CMSAdmin extends AbstractCommand
     @Command(name = "dump", description = "Dumps cluster metadata into a file")
     public static class DumpClusterMetadata extends AbstractCommand
     {
-        @ArgGroup(exclusive = false, multiplicity = "0..1")
-        DumpOptions dumpOptions;
+        @Option(names = { "-e", "--epoch" }, paramLabel = "epoch",
+        description = "Epoch at which cluster metadata should be dumped")
+        Long epoch;
 
-        static class DumpOptions
-        {
-            @Option(names = { "-e", "--epoch" }, paramLabel = "epoch",
-            description = "Epoch at which cluster metadata should be dumped", required = true)
-            Long epoch;
+        @Option(names = { "-te", "--transform-epoch" }, paramLabel = "transform_epoch",
+        description = "Force metadata to given X epoch while dumping")
+        Long transformEpoch;
 
-            @Option(names = { "-te", "--transform-epoch" }, paramLabel = "transform_epoch",
-            description = "Force metadata to given X epoch while dumping", required = true)
-            Long transformEpoch;
-
-            @Option(names = { "-sv", "--serialization-version" }, paramLabel = "serialization_version",
-            description = "Serialization Version", required = true)
-            Version version;
-        }
+        @Option(names = { "-sv", "--serialization-version" }, paramLabel = "serialization_version",
+        description = "Serialization Version")
+        Version version;
 
         @Override
         protected void execute(NodeProbe probe)
         {
+            boolean noneSet = epoch == null && transformEpoch == null && version == null;
+            boolean allSet = epoch != null && transformEpoch != null && version != null;
+            checkArgument(noneSet || allSet,
+                          "Options --epoch, --transform-epoch and --serialization-version must be set together or not at all");
             try
             {
-                if (dumpOptions == null)
-                {
-                    String fileLocation = probe.getCMSOperationsProxy().dumpClusterMetadata();
-                    printCMSDumpLocation(probe, fileLocation);
-                }
-                else
-                {
-                    String fileLocation = probe.getCMSOperationsProxy().dumpClusterMetadata(dumpOptions.epoch,
-                                                                                            dumpOptions.transformEpoch,
-                                                                                            dumpOptions.version.name());
-                    printCMSDumpLocation(probe, fileLocation);
-                }
+                String fileLocation = noneSet ? probe.getCMSOperationsProxy().dumpClusterMetadata()
+                                              : probe.getCMSOperationsProxy().dumpClusterMetadata(epoch, transformEpoch, version.name());
+                printCMSDumpLocation(probe, fileLocation);
             }
             catch (IOException e)
             {

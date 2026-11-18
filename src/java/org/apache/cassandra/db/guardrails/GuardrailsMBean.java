@@ -390,22 +390,40 @@ public interface GuardrailsMBean
     void setBulkLoadEnabled(boolean enabled);
 
     /**
-     * @return The threshold to warn when requested page size greater than threshold.
+     * @return The threshold to warn when a requested row page size exceeds the given number of rows.
      * -1 means disabled.
      */
     int getPageSizeWarnThreshold();
 
     /**
-     * @return The threshold to prevent requesting page with more elements than threshold.
+     * @return The threshold to prevent requesting row pages with more rows than threshold.
      * -1 means disabled.
      */
     int getPageSizeFailThreshold();
 
     /**
-     * @param warn The threshold to warn when the requested page size is greater than threshold. -1 means disabled.
-     * @param fail The threshold to prevent requesting pages with more elements than threshold. -1 means disabled.
+     * @param warn The threshold to warn when the requested row page size is greater than threshold. -1 means disabled.
+     * @param fail The threshold to prevent requesting row pages with more rows than threshold. -1 means disabled.
      */
     void setPageSizeThreshold(int warn, int fail);
+
+    /**
+     * @return The byte page size warning threshold, with units such as {@code MiB}. {@code null} disables it.
+     */
+    @Nullable
+    String getPageSizeInBytesWarnThreshold();
+
+    /**
+     * @return The byte page size failure threshold, with units such as {@code MiB}. {@code null} disables it.
+     */
+    @Nullable
+    String getPageSizeInBytesFailThreshold();
+
+    /**
+     * @param warnSize The requested byte page size above which to warn, such as {@code 1MiB}. {@code null} disables it.
+     * @param failSize The requested byte page size above which to fail, such as {@code 2MiB}. {@code null} disables it.
+     */
+    void setPageSizeInBytesThreshold(@Nullable String warnSize, @Nullable String failSize);
 
     /**
      * Returns whether list operations that require read before write are allowed.
@@ -911,6 +929,17 @@ public interface GuardrailsMBean
     void setMinimumReplicationFactorThreshold (int warn, int fail);
 
     /**
+     * @return The threshold to fail when the CMS size (aggregate replication factor across DCs) is below the threshold.
+     */
+    int getMinimumCmsSizeFailThreshold();
+
+    /**
+     * @param fail The threshold to fail when the CMS size (aggregate replication factor across DCs) is below it.
+     *             -1 means disabled.
+     */
+    void setMinimumCmsSizeFailThreshold(int fail);
+
+    /**
      * @return The threshold to fail when replication factor is greater than threshold.
      */
     int getMaximumReplicationFactorWarnThreshold();
@@ -1056,6 +1085,30 @@ public interface GuardrailsMBean
      *                 A {@code null} value means disabled.
      */
     void setSaiStringTermSizeThreshold(@Nullable String warnSize, @Nullable String failSize);
+
+    /**
+     * @return The warning threshold for blob terms written to an SAI index, as a human-readable string.
+     *         (ex. {@code 10GiB}, {@code 20MiB}, {@code 30KiB} or {@code 40B}) A {@code null} value means disabled.
+     */
+    @Nullable
+    String getSaiBlobTermSizeWarnThreshold();
+
+    /**
+     * @return The failure threshold for blob terms written to an SAI index, as a human-readable string.
+     *         (ex. {@code 10GiB}, {@code 20MiB}, {@code 30KiB} or {@code 40B}) A {@code null} value means disabled.
+     */
+    @Nullable
+    String getSaiBlobTermSizeFailThreshold();
+
+    /**
+     * @param warnSize The warning threshold for blob terms written to an SAI index, as a human-readable string.
+     *                 (ex. {@code 10GiB}, {@code 20MiB}, {@code 30KiB} or {@code 40B})
+     *                 A {@code null} value means disabled.
+     * @param failSize The failure threshold for blob terms written to an SAI index, as a human-readable string.
+     *                 (ex. {@code 10GiB}, {@code 20MiB}, {@code 30KiB} or {@code 40B})
+     *                 A {@code null} value means disabled.
+     */
+    void setSaiBlobTermSizeThreshold(@Nullable String warnSize, @Nullable String failSize);
 
     /**
      * @return The warning threshold for frozen terms written to an SAI index, as a human-readable string.
@@ -1240,4 +1293,20 @@ public interface GuardrailsMBean
      * @param enabled {@code true} to reject, {@code false} to allow.
      */
     void setPreparedStatementsRequireParametersEnabled(boolean enabled);
+
+    /**
+     * @return The threshold to warn when creating a table with a Zstd compression level above it.
+     */
+    int getZstdCompressionLevelWarnThreshold();
+
+    /**
+     * @return The threshold to fail when creating a table with a Zstd compression level above it.
+     */
+    int getZstdCompressionLevelFailThreshold();
+
+    /**
+     * @param warn The threshold to warn when creating a table with a Zstd compression level above it. -1 means disabled.
+     * @param fail The threshold to prevent creating a table with a Zstd compression level above it. -1 means disabled.
+     */
+    void setZstdCompressionLevelThreshold(int warn, int fail);
 }

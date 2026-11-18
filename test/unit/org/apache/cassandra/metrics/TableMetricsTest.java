@@ -20,24 +20,31 @@ package org.apache.cassandra.metrics;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import com.codahale.metrics.Counter;
+import com.codahale.metrics.Gauge;
 import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.Session;
 import com.google.common.util.concurrent.Uninterruptibles;
 
+import org.awaitility.Awaitility;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.ServerTestUtils;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.TestDatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.service.EmbeddedCassandraService;
 import org.apache.cassandra.service.StorageService;
@@ -45,6 +52,8 @@ import org.apache.cassandra.service.StorageService;
 import static org.apache.cassandra.cql3.CQLTester.assertRowsContains;
 import static org.apache.cassandra.cql3.CQLTester.row;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 public class TableMetricsTest
@@ -62,6 +71,13 @@ public class TableMetricsTest
     @BeforeClass
     public static void setup() throws ConfigurationException, IOException
     {
+        CassandraRelevantProperties.VIRTUAL_KEYSPACE_SYSTEM_METRICS_ENABLED.setBoolean(true);
+        CassandraRelevantProperties.SIZE_RECORDER_INTERVAL.setInt(0);
+        DatabaseDescriptor.daemonInitialization(() -> {
+            Config config = DatabaseDescriptor.loadConfig();
+            config.memtable_allocation_type = Config.MemtableAllocationType.offheap_objects;
+            return config;
+        });
         cassandra = ServerTestUtils.startEmbeddedCassandraService();
 
         cluster = Cluster.builder().addContactPoint("127.0.0.1").withPort(DatabaseDescriptor.getNativeTransportPort()).build();
@@ -379,6 +395,55 @@ public class TableMetricsTest
         assertGreaterThan(cfs.metric.coordinatorWriteLatency.getMeanRate(), 0);
     }
 
+    @Test
+    public void testGlobalMemtableDataSizeIsSumOfTables()
+    {
+        final String secondTable = TABLE + "_second";
+        ColumnFamilyStore first = recreateTable();
+        ColumnFamilyStore second = recreateTable(secondTable);
+        String value = "x".repeat(1024);
+        for (String table : new String[]{ TABLE, secondTable })
+        {
+            PreparedStatement ps = session.prepare(String.format("INSERT INTO %s.%s (id, val1, val2) VALUES (?, ?, ?)", KEYSPACE, table));
+            for (int i = 0; i < 100; i++)
+                session.execute(ps.bind(i, "a", value));
+        }
+
+        assertGreaterThan(first.metric.memtableOnHeapDataSize.getValue(), 0);
+        assertGreaterThan(second.metric.memtableOffHeapDataSize.getValue(), 0);
+
+        Iterable<ColumnFamilyStore> allCfs = ColumnFamilyStore.all();
+        try (CompactionManager.CompactionPauser globalPause = CompactionManager.instance.pauseGlobalCompaction();
+             CompactionManager.CompactionPauser strategiesPause = TestDatabaseDescriptor.pauseAllCompactionStrategies(allCfs))
+        {
+            CompactionManager.instance.waitForCessation(allCfs, sstable -> true);
+
+            assertNotEquals("on-heap and off-heap usage must differ to tell the gauges apart",
+                            sumOfTables(m -> m.memtableOnHeapDataSize),
+                            sumOfTables(m -> m.memtableOffHeapDataSize));
+            assertGlobalIsSumOfTables("MemtableOnHeapDataSize", m -> m.memtableOnHeapDataSize);
+            assertGlobalIsSumOfTables("MemtableOffHeapDataSize", m -> m.memtableOffHeapDataSize);
+        }
+    }
+
+    private static void assertGlobalIsSumOfTables(String name, Function<TableMetrics, Gauge<Long>> perTable)
+    {
+        Gauge<?> global = CassandraMetricsRegistry.Metrics.getGauges().get(String.format("org.apache.cassandra.metrics.Table.%s.all", name));
+        assertNotNull(String.format("global gauge %s is not registered", name), global);
+        assertEquals(String.format("global %s must equal the sum of per-table values", name),
+                     sumOfTables(perTable),
+                     ((Number) global.getValue()).longValue());
+    }
+
+    private static long sumOfTables(Function<TableMetrics, Gauge<Long>> perTable)
+    {
+        long total = 0;
+        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+            for (ColumnFamilyStore store : cfs.concatWithIndexes())
+                total += perTable.apply(store.metric).getValue();
+        return total;
+    }
+
     private static void assertGreaterThan(double actual, double expectedLessThan) {
         assertTrue("Expected " + actual + " > " + expectedLessThan, actual > expectedLessThan);
     }
@@ -423,6 +488,72 @@ public class TableMetricsTest
         assertEquals(metrics.get().collect(Collectors.joining(",")), 0, metrics.get().count());
     }
 
+    @Test
+    public void testEstimatedPartitionCount() throws InterruptedException
+    {
+        long prevPeriod = TableMetrics.ESTIMATED_PARTITION_COUNT_CACHE_PERIOD_SECONDS;
+        try
+        {
+            // The gauge takes its period when the table is created. UCS also reads the gauge, so these checks
+            // never assume when a period started. The first part uses a period longer than the test, the second
+            // only waits for a refresh.
+            TableMetrics.ESTIMATED_PARTITION_COUNT_CACHE_PERIOD_SECONDS = TimeUnit.HOURS.toSeconds(1);
+            doTestEstimatedPartitionCount();
+            TableMetrics.ESTIMATED_PARTITION_COUNT_CACHE_PERIOD_SECONDS = 1;
+            doTestEstimatedPartitionCountRefresh();
+        }
+        finally
+        {
+            TableMetrics.ESTIMATED_PARTITION_COUNT_CACHE_PERIOD_SECONDS = prevPeriod;
+        }
+    }
+
+    private void doTestEstimatedPartitionCount()
+    {
+        ColumnFamilyStore cfs = recreateTable();
+        assertEquals(0L, cfs.metric.estimatedPartitionCount.getValue().longValue());
+        assertEquals(0L, cfs.metric.estimatedPartitionCountInSSTablesCached.getValue().longValue());
+
+        int partitionCount = 10;
+        int numRows = 100;
+
+        for (int i = 0; i < numRows; i++)
+            session.execute(String.format("INSERT INTO %s.%s (id, val1, val2) VALUES (%d, '%s', '%s')", KEYSPACE, TABLE, i % partitionCount, "val" + i, "val" + i));
+
+        assertEquals(partitionCount, cfs.metric.estimatedPartitionCount.getValue().longValue());
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+        assertEquals(partitionCount, cfs.metric.estimatedPartitionCount.getValue().longValue());
+
+        // The cached count was loaded before the flush and is kept for the whole period.
+        assertEquals(0L, cfs.metric.estimatedPartitionCountInSSTablesCached.getValue().longValue());
+
+        for (int i = 0; i < numRows; i++)
+            session.execute(String.format("INSERT INTO %s.%s (id, val1, val2) VALUES (%d, '%s', '%s')", KEYSPACE, TABLE, i % partitionCount, "val" + i, "val" + i));
+
+        assertEquals(0L, cfs.metric.estimatedPartitionCountInSSTablesCached.getValue().longValue());
+
+        // The answer below is incorrect but what the metric currently returns.
+        assertEquals(partitionCount * 2, cfs.metric.estimatedPartitionCount.getValue().longValue());
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+        // Recalculation for the new sstable set will correct it.
+        assertEquals(partitionCount, cfs.metric.estimatedPartitionCount.getValue().longValue());
+    }
+
+    private void doTestEstimatedPartitionCountRefresh()
+    {
+        ColumnFamilyStore cfs = recreateTable();
+        assertEquals(0L, cfs.metric.estimatedPartitionCountInSSTablesCached.getValue().longValue());
+
+        int partitionCount = 10;
+        for (int i = 0; i < partitionCount; i++)
+            session.execute(String.format("INSERT INTO %s.%s (id, val1, val2) VALUES (%d, '%s', '%s')", KEYSPACE, TABLE, i, "val" + i, "val" + i));
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        // With a one second period the cached count catches up with the flushed sstable.
+        Awaitility.await()
+                  .atMost(10, TimeUnit.SECONDS)
+                  .untilAsserted(() -> assertEquals(partitionCount, (long) cfs.metric.estimatedPartitionCountInSSTablesCached.getValue()));
+    }
 
     @AfterClass
     public static void tearDown()

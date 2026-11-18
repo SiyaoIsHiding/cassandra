@@ -50,6 +50,7 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
@@ -114,8 +115,8 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     private final int cachedRowsWarnThreshold;
     private final int cachedRowsFailThreshold;
 
-    /** Tracks whether or not we've already hit the warning threshold while evaluating a partition. */
-    private boolean hitWarningThreshold = false;
+    /** Tracks whether or not we've already hit the failure threshold, which makes the warning redundant. */
+    private boolean hitFailureThreshold = false;
 
     private int currentRowsCached = 0; // tracks the current number of cached rows
     private int maxRowsCached = 0; // tracks the high watermark for the number of cached rows
@@ -196,6 +197,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         final EncodingStats stats;
         final boolean[] silentRowAt;
         final boolean[] silentColumnAt;
+        Clustering<?> lastClustering;
         
         PartitionMergeListerner(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
         {
@@ -221,6 +223,9 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         @Override
         public void onMergedRows(Row merged, Row[] versions)
         {
+            if (!merged.isStatic())
+                lastClustering = merged.clustering();
+
             // Cache the row versions to be able to regenerate the original row iterator:
             for (int i = 0; i < versions.length; i++)
                 builders.get(i).addRow(versions[i]);
@@ -278,7 +283,10 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public void populate()
         {
             for (int i = 0; i < sources.size(); i++)
+            {
+                builders.get(i).closeOpenMarker(lastClustering);
                 originalPartitions.get(i).add(builders.get(i));
+            }
         }
     }
 
@@ -290,7 +298,22 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public void close()
         {
             // If we hit the failure threshold before consuming a single partition, record the current rows cached.
-            tableMetrics.rfpRowsCachedPerQuery.update(Math.max(currentRowsCached, maxRowsCached));
+            maxRowsCached = Math.max(currentRowsCached, maxRowsCached);
+            tableMetrics.rfpRowsCachedPerQuery.update(maxRowsCached);
+
+            // The warning threshold is checked here, at the end of the query, so that the warning names the high
+            // watermark for the whole query, and so that one query produces at most one warning.
+            if (!hitFailureThreshold && maxRowsCached > cachedRowsWarnThreshold)
+            {
+                String message = String.format("Replica filtering protection has cached up to %d rows during query %s, " +
+                                               "which is over the warning threshold of %d rows defined by " +
+                                               "'cached_replica_rows_warn_threshold' in cassandra.yaml.",
+                                               maxRowsCached, command.toCQLString(), cachedRowsWarnThreshold);
+
+                ClientWarn.instance.warn(message);
+                oneMinuteLogger.warn(message);
+                Tracing.trace(message);
+            }
         }
 
         @Override
@@ -324,33 +347,25 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     {
         currentRowsCached++;
 
+        // The failure threshold is checked on every increment, so that the query aborts as soon as it is crossed.
         if (currentRowsCached == cachedRowsFailThreshold + 1)
         {
-            String message = String.format("Replica filtering protection has cached over %d rows during query %s. " +
-                                           "(See 'cached_replica_rows_fail_threshold' in cassandra.yaml.)",
-                                           cachedRowsFailThreshold, command.toCQLString());
+            hitFailureThreshold = true;
+
+            String message = String.format("Replica filtering protection has cached %d rows during query %s, " +
+                                           "which is over the failure threshold of %d rows defined by " +
+                                           "'cached_replica_rows_fail_threshold' in cassandra.yaml.",
+                                           currentRowsCached, command.toCQLString(), cachedRowsFailThreshold);
 
             logger.error(message);
             Tracing.trace(message);
             throw new OverloadedException(message);
         }
-        else if (currentRowsCached == cachedRowsWarnThreshold + 1 && !hitWarningThreshold)
-        {
-            hitWarningThreshold = true;
-
-            String message = String.format("Replica filtering protection has cached over %d rows during query %s. " +
-                                           "(See 'cached_replica_rows_warn_threshold' in cassandra.yaml.)",
-                                           cachedRowsWarnThreshold, command.toCQLString());
-
-            ClientWarn.instance.warn(message);
-            oneMinuteLogger.warn(message);
-            Tracing.trace(message);
-        }
     }
 
     private void releaseCachedRows(int count)
     {
-        maxRowsCached = Math.max(maxRowsCached, currentRowsCached);
+        maxRowsCached = Math.max(currentRowsCached, maxRowsCached);
         currentRowsCached -= count;
     }
 
@@ -419,19 +434,16 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
                         if (currentRowIterator != null)
                         {
-                            int i = 0;
-
-                            // Consume LIMIT filtered rows from the current partition, unless there are fewer results.
-                            // The underlying iterator is short-read protected, and limiting the number of rows we
-                            // consume avoids needless SRP reads when there are many more than LIMIT results.
-                            while (i < command.limits().count() && currentRowIterator.hasNext())
-                            {
-                                currentRowIterator.next();
-                                i++;
-                            }
+                            // Bound each page by rows and bytes before short-read protection fetches more data.
+                            DataLimits.Counter counter = DataLimits.cqlLimits(command.limits().count())
+                                                                   .withBytesLimit(command.limits().bytes())
+                                                                   .newCounter(command.nowInSec(), true, false, command.metadata().enforceStrictLiveness());
+                            counter.applyToPartition(currentRowIterator.partitionKey(), currentRowIterator.staticRow());
+                            while (!counter.isDone() && currentRowIterator.hasNext())
+                                counter.applyToRow(currentRowIterator.next());
 
                             // If we actually consumed a row, checkpoint to populate the builders.
-                            if (i > 0)
+                            if (counter.rowsCounted() > 0)
                                 mergeListener.populate();
                         }
                     }
@@ -460,6 +472,8 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         private DeletionTime deletionTime;
         private Row staticRow = Rows.EMPTY_STATIC_ROW;
         private final Queue<Unfiltered> contents = new ArrayDeque<>();
+        private DeletionTime openDeletion;
+        private RangeTombstoneMarker reopenMarker;
         private BTreeSet.Builder<Clustering<?>> toFetch;
         private int partitionRowsCached;
 
@@ -490,15 +504,52 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 return;
 
             if (row.isStatic())
+            {
                 staticRow = row;
+            }
             else
+            {
+                addReopenMarker();
                 contents.add(row);
+            }
         }
 
         private void addRangeTombstoneMarker(RangeTombstoneMarker marker)
         {
-            if (marker != null)
-                contents.add(marker);
+            if (null == marker)
+                return;
+
+            boolean reversed = command.isReversed();
+            addReopenMarker();
+            openDeletion = marker.isOpen(reversed) ? marker.openDeletionTime(reversed) : null;
+            contents.add(marker);
+        }
+
+        /**
+         * Each page's protected partition must close the ranges it opens, as the next page is merged separately.
+         * Close an open range after the last row of the page, and reopen it before this replica's next item.
+         */
+        private void closeOpenMarker(Clustering<?> lastClustering)
+        {
+            if (null == openDeletion)
+                return;
+
+            assert null != lastClustering : "open deletion with no merged row to anchor the close bound at";
+
+            // A replica with nothing since the previous page still needs the range, to shadow other replicas' rows.
+            addReopenMarker();
+            boolean reversed = command.isReversed();
+            contents.add(RangeTombstoneBoundMarker.inclusiveClose(reversed, lastClustering, openDeletion));
+            reopenMarker = RangeTombstoneBoundMarker.exclusiveOpen(reversed, lastClustering, openDeletion);
+        }
+
+        private void addReopenMarker()
+        {
+            if (null == reopenMarker)
+                return;
+
+            contents.add(reopenMarker);
+            reopenMarker = null;
         }
 
         private void addToFetch(Row row)

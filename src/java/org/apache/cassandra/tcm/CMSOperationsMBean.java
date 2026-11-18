@@ -36,6 +36,9 @@ public interface CMSOperationsMBean
     public long getCmsCommitRetryMaxDelayMillis();
     public void setCmsCommitRetryMaxDelayMillis(long delayInMillis);
 
+    public long getCmsReconfigurationWaitTimeoutMillis();
+    public void setCmsReconfigurationWaitTimeoutMillis(long timeoutInMillis);
+
     /** Get the CMS commit member preference policy
      *
      * @return how to choose the cms member preference order for commits
@@ -52,7 +55,9 @@ public interface CMSOperationsMBean
     public void abortInitialization(String initiator);
     public void resumeReconfigureCms();
     public void reconfigureCMS(int rf);
+    public void reconfigureCMS(int rf, List<String> ignoredEndpoints);
     public void reconfigureCMS(Map<String, Integer> rf);
+    public void reconfigureCMS(Map<String, Integer> rf, List<String> ignoredEndpoints);
     public Map<String, List<String>> reconfigureCMSStatus();
     public void cancelReconfigureCms();
 

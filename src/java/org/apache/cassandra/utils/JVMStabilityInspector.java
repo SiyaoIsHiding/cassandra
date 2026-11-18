@@ -19,7 +19,6 @@ package org.apache.cassandra.utils;
 
 import java.io.FileNotFoundException;
 import java.net.SocketException;
-import java.nio.channels.ClosedByInterruptException;
 import java.nio.file.FileSystemException;
 import java.util.ArrayList;
 import java.util.List;
@@ -74,7 +73,9 @@ public final class JVMStabilityInspector
         try { StorageMetrics.uncaughtExceptions.inc(); } catch (Throwable ignore) { /* might not be initialised */ }
         logger.error("Exception in thread {}", thread, t);
         Tracing.trace("Exception in thread {}", thread, t);
-        ExceptionsTable.persist(t);
+        // Recording the exception for observability must never preempt the stability handling below (the
+        // disk_failure_policy / OOM "die" actions in inspectThrowable). Guard it like the StorageMetrics increment above.
+        try { ExceptionsTable.persist(t); } catch (Throwable ignore) { /* observability only, must not throw here */ }
         for (Throwable t2 = t; t2 != null; t2 = t2.getCause())
         {
             // make sure error gets logged exactly once.
@@ -159,7 +160,7 @@ public final class JVMStabilityInspector
             throw (UncheckedInterruptedException)t;
 
         if (DatabaseDescriptor.getDiskFailurePolicy() == Config.DiskFailurePolicy.die)
-            if ((t instanceof FSError || t instanceof CorruptSSTableException) && !(t.getCause() instanceof ClosedByInterruptException))
+            if ((t instanceof FSError || t instanceof CorruptSSTableException) && !Throwables.isCausedByInterrupt(t))
                 isUnstable = true;
 
         // Check for file handle exhaustion
@@ -187,20 +188,25 @@ public final class JVMStabilityInspector
             inspectThrowable(t.getCause(), fn, isUncaughtException);
     }
 
-    private static final Set<String> FORCE_HEAP_OOM_IGNORE_SET = ImmutableSet.of("Java heap space", "GC Overhead limit exceeded");
+    private static final Set<String> FORCE_HEAP_OOM_IGNORE_SET = ImmutableSet.of("Java heap space", "GC overhead limit exceeded");
+    private static final String DIRECT_BUFFER_OOM_MESSAGE = "direct buffer memory";
 
     /**
-     * Intentionally produce a heap space OOM upon seeing a non heap memory OOM.
-     * Direct buffer OOM cannot trigger JVM OOM error related options,
+     * Intentionally produce a heap space OOM upon seeing an OOM that the JVM does not treat as a heap OOM.
+     * Such OOMs, direct buffer exhaustion in particular, cannot trigger JVM OOM error related options,
      * e.g. OnOutOfMemoryError, HeapDumpOnOutOfMemoryError, etc.
      * See CASSANDRA-15214 and CASSANDRA-17128 for more details
      */
     @Exclude // Exclude from just in time compilation.
     private static void forceHeapSpaceOomMaybe(OutOfMemoryError oom)
     {
-        if (FORCE_HEAP_OOM_IGNORE_SET.contains(oom.getMessage()))
+        String message = oom.getMessage();
+        if (FORCE_HEAP_OOM_IGNORE_SET.contains(message))
             return;
-        logger.error("Force heap space OutOfMemoryError in the presence of", oom);
+        if (message != null && LocalizeString.toLowerCaseLocalized(message).contains(DIRECT_BUFFER_OOM_MESSAGE))
+            logger.error("Off-heap (direct buffer) OutOfMemoryError detected, forcing a heap OutOfMemoryError to trigger standard JVM OOM handling:", oom);
+        else
+            logger.error("OutOfMemoryError detected, forcing a heap OutOfMemoryError to trigger standard JVM OOM handling:", oom);
         // Start to produce heap space OOM forcibly.
         List<long[]> ignored = new ArrayList<>();
         while (true)

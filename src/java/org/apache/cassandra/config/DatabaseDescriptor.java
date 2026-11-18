@@ -77,6 +77,7 @@ import org.apache.cassandra.auth.AuthConfig;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.auth.IAuthorizer;
 import org.apache.cassandra.auth.ICIDRAuthorizer;
+import org.apache.cassandra.auth.IDefaultRoleInitializer;
 import org.apache.cassandra.auth.IInternodeAuthenticator;
 import org.apache.cassandra.auth.INetworkAuthorizer;
 import org.apache.cassandra.auth.IRoleManager;
@@ -85,6 +86,7 @@ import org.apache.cassandra.config.Config.DiskAccessMode;
 import org.apache.cassandra.config.Config.PaxosOnLinearizabilityViolation;
 import org.apache.cassandra.config.Config.PaxosStatePurging;
 import org.apache.cassandra.config.DurationSpec.IntMillisecondsBound;
+import org.apache.cassandra.cql3.PageSize;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.commitlog.AbstractCommitLogSegmentManager;
@@ -240,6 +242,7 @@ public class DatabaseDescriptor
     // Don't initialize the role manager until applying config. The options supported by CassandraRoleManager
     // depend on the configured IAuthenticator, so defer creating it until that's been set.
     private static IRoleManager roleManager;
+    private static IDefaultRoleInitializer defaultRoleInitializer;
 
     private static long preparedStatementsCacheSizeInMiB;
 
@@ -675,6 +678,9 @@ public class DatabaseDescriptor
             }
         }
 
+        if (conf.accord.durability_flush_interval == null)
+            conf.accord.durability_flush_interval = conf.accord.shard_durability_cycle;
+
         /* evaluate the DiskAccessMode Config directive, which also affects indexAccessMode selection */
         if (conf.disk_access_mode == DiskAccessMode.auto || conf.disk_access_mode == DiskAccessMode.mmap_index_only)
         {
@@ -741,18 +747,7 @@ public class DatabaseDescriptor
         if (conf.file_cache_round_up == null)
             conf.file_cache_round_up = conf.disk_optimization_strategy == Config.DiskOptimizationStrategy.spinning;
 
-        if (conf.memtable_offheap_space == null)
-            conf.memtable_offheap_space = new DataStorageSpec.IntMebibytesBound((int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));
-        // for the moment, we default to twice as much on-heap space as off-heap, as heap overhead is very large
-        if (conf.memtable_heap_space == null)
-            conf.memtable_heap_space = new DataStorageSpec.IntMebibytesBound((int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));
-        if (conf.memtable_heap_space.toMebibytes() == 0)
-            throw new ConfigurationException("memtable_heap_space must be positive, but was " + conf.memtable_heap_space, false);
-        logger.info("Global memtable on-heap threshold is enabled at {}", conf.memtable_heap_space);
-        if (conf.memtable_offheap_space.toMebibytes() == 0)
-            logger.info("Global memtable off-heap threshold is disabled, HeapAllocator will be used instead");
-        else
-            logger.info("Global memtable off-heap threshold is enabled at {}", conf.memtable_offheap_space);
+        applyMemtableSpace(conf);
 
         if (conf.repair_session_max_tree_depth != null)
         {
@@ -1258,6 +1253,9 @@ public class DatabaseDescriptor
                                                            conf.progress_barrier_default_consistency_level, progressBarrierCLsArr));
         }
 
+        if (conf.cms_reconfiguration_wait_timeout.toMilliseconds() <= 0)
+            throw new ConfigurationException("cms_reconfiguration_wait_timeout must be positive, but was " + conf.cms_reconfiguration_wait_timeout, false);
+
         if (conf.native_transport_min_backoff_on_queue_overload.toMilliseconds() <= 0)
             throw new ConfigurationException(" be positive");
 
@@ -1288,6 +1286,11 @@ public class DatabaseDescriptor
         {
             throw new ConfigurationException(ex.getMessage());
         }
+
+        if (conf.aggregation_subpage_size.toBytes() < 0)
+            throw new ConfigurationException("aggregation_subpage_size_in_kb must be >= 0");
+
+        setAggregationSubPageSize(getAggregationSubPageSize());
     }
 
     @VisibleForTesting
@@ -1317,6 +1320,36 @@ public class DatabaseDescriptor
         if (conf.compaction_throughput.toMebibytesPerSecond() >= Integer.MAX_VALUE)
         {
             throw new ConfigurationException("Invalid value of compaction_throughput: " + conf.compaction_throughput.toString(), false);
+        }
+    }
+
+    @VisibleForTesting
+    static void applyMemtableSpace(Config conf)
+    {
+        if (conf.memtable_offheap_space == null)
+            conf.memtable_offheap_space = new DataStorageSpec.IntMebibytesBound((int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));
+        // for the moment, we default to twice as much on-heap space as off-heap, as heap overhead is very large
+        if (conf.memtable_heap_space == null)
+            conf.memtable_heap_space = new DataStorageSpec.IntMebibytesBound((int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));
+        if (conf.memtable_heap_space.toMebibytes() == 0)
+            throw new ConfigurationException("memtable_heap_space must be positive, but was " + conf.memtable_heap_space, false);
+        logger.info("Global memtable on-heap threshold is enabled at {}", conf.memtable_heap_space);
+
+        if (conf.memtable_offheap_space.toMebibytes() != 0)
+        {
+            logger.info("Global memtable off-heap threshold is enabled at {}", conf.memtable_offheap_space);
+        }
+        else
+        {
+            // offheap_buffers and offheap_objects with a limit of 0 would leave that usage unbounded
+            if (conf.memtable_allocation_type == Config.MemtableAllocationType.offheap_buffers
+                    || conf.memtable_allocation_type == Config.MemtableAllocationType.offheap_objects)
+                throw new ConfigurationException("memtable_offheap_space must be positive when memtable_allocation_type is "
+                                                 + conf.memtable_allocation_type
+                                                 + ", otherwise off-heap memtable memory is not limited", false);
+
+            logger.info("Global memtable off-heap threshold is 0; memtable_allocation_type {} does not allocate off-heap",
+                        conf.memtable_allocation_type);
         }
     }
 
@@ -1401,6 +1434,7 @@ public class DatabaseDescriptor
         }
     }
 
+    // TODO (expected): move all of the Accord config setup and accessors into AccordConfig
     private static void applyAccord()
     {
         try
@@ -2226,6 +2260,16 @@ public class DatabaseDescriptor
         DatabaseDescriptor.roleManager = roleManager;
     }
 
+    public static IDefaultRoleInitializer getDefaultRoleInitializer()
+    {
+        return defaultRoleInitializer;
+    }
+
+    public static void setDefaultRoleInitializer(IDefaultRoleInitializer defaultRoleInitializer)
+    {
+        DatabaseDescriptor.defaultRoleInitializer = defaultRoleInitializer;
+    }
+
     public static int getPermissionsValidity()
     {
         return conf.permissions_validity.toMilliseconds();
@@ -2983,6 +3027,20 @@ public class DatabaseDescriptor
             throw new IllegalArgumentException("Concurrent accord operations must be non-negative");
         }
         conf.accord.queue_thread_count = new OptionaldPositiveInt(concurrent_operations);
+    }
+
+    public static int getAccordConcurrentMigrationOps()
+    {
+        return conf.accord.migration_concurrency.or(2 * FBUtilities.getAvailableProcessors());
+    }
+
+    public static void setConcurrentAccordMigrationOps(int concurrent_operations)
+    {
+        if (concurrent_operations < 0)
+        {
+            throw new IllegalArgumentException("Concurrent accord operations must be non-negative");
+        }
+        conf.accord.migration_concurrency = new OptionaldPositiveInt(concurrent_operations);
     }
 
     public static int getFlushWriters()
@@ -4514,9 +4572,9 @@ public class DatabaseDescriptor
         return conf.trickle_fsync;
     }
 
-    public static int getTrickleFsyncIntervalInKiB()
+    public static long getTrickleFsyncIntervalInBytes()
     {
-        return conf.trickle_fsync_interval.toKibibytes();
+        return conf.trickle_fsync_interval.toBytesInLong();
     }
 
     public static long getKeyCacheSizeInMiB()
@@ -4680,6 +4738,16 @@ public class DatabaseDescriptor
     public static boolean setStreamEntireSSTables(boolean value)
     {
         return conf.stream_entire_sstables = value;
+    }
+
+    public static boolean getEntireSSTableStreamDigestValidationEnabled()
+    {
+        return conf.entire_sstable_stream_digest_validation_enabled;
+    }
+
+    public static void setEntireSSTableStreamDigestValidationEnabled(boolean value)
+    {
+        conf.entire_sstable_stream_digest_validation_enabled = value;
     }
 
     public static DurationSpec.LongMillisecondsBound getStreamTransferTaskTimeout()
@@ -5877,6 +5945,11 @@ public class DatabaseDescriptor
         return conf.accord.shard_durability_cycle.to(unit);
     }
 
+    public static long getAccordDurabilityFlushInterval(TimeUnit unit)
+    {
+        return conf.accord.durability_flush_interval.to(unit);
+    }
+
     public static boolean getAccordStateCacheListenerJFREnabled()
     {
         return conf.accord.state_cache_listener_jfr_enabled;
@@ -6313,6 +6386,21 @@ public class DatabaseDescriptor
         }
     }
 
+    public static DurationSpec getCmsReconfigurationWaitTimeout()
+    {
+        return conf.cms_reconfiguration_wait_timeout;
+    }
+
+    public static void setCmsReconfigurationWaitTimeout(long timeoutInMillis)
+    {
+        Preconditions.checkArgument(timeoutInMillis > 0, "cms_reconfiguration_wait_timeout must be positive, but was %sms", timeoutInMillis);
+        if (timeoutInMillis != conf.cms_reconfiguration_wait_timeout.to(TimeUnit.MILLISECONDS))
+        {
+            logger.info("Setting cms_reconfiguration_wait_timeout to {}ms", timeoutInMillis);
+            conf.cms_reconfiguration_wait_timeout = new DurationSpec.LongMillisecondsBound(timeoutInMillis);
+        }
+    }
+
     public static RetryStrategy getCmsCommitRetryStrategy()
     {
         return cms_commit_retry_strategy;
@@ -6500,5 +6588,20 @@ public class DatabaseDescriptor
     public static void setGossipQuarantineDisabled(boolean disabled)
     {
         conf.gossip_quarantine_disabled = disabled;
+    }
+
+    public static PageSize getAggregationSubPageSize()
+    {
+        if (conf.aggregation_subpage_size.toBytes() == 0)
+            return PageSize.NONE;
+
+        return PageSize.inBytes(conf.aggregation_subpage_size.toBytes());
+    }
+
+    public static void setAggregationSubPageSize(PageSize pageSize)
+    {
+        Preconditions.checkArgument(!pageSize.isDefined() || pageSize.getUnit() == PageSize.PageUnit.BYTES);
+        Preconditions.checkArgument(pageSize.bytes() >= 0);
+        conf.aggregation_subpage_size = new DataStorageSpec.IntBytesBound(pageSize.isDefined() ? pageSize.bytes() : 0);
     }
 }

@@ -56,6 +56,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.PageSize;
 import org.apache.cassandra.cql3.QueryHandler.Prepared;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
@@ -1856,6 +1857,25 @@ public final class SystemKeyspace
         executeInternal(format(cql, SchemaConstants.SYSTEM_KEYSPACE_NAME, AVAILABLE_RANGES_V2), keyspace);
     }
 
+    /**
+     * Wipes the whole table rather than deleting per (operation, keyspace): keyspace_name is part of the
+     * partition key, so an operation-scoped delete would have to iterate keyspaces. Safe because the
+     * decommission path is the only reader - see getTransferredRanges. Revisit if another topology
+     * change starts consulting this table.
+     */
+    public static synchronized void resetTransferredRanges()
+    {
+        Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(TRANSFERRED_RANGES_V2).truncateBlockingWithoutSnapshot();
+        try
+        {
+            Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(LEGACY_TRANSFERRED_RANGES).truncateBlockingWithoutSnapshot();
+        }
+        catch (Throwable t)
+        {
+            logger.warn("failed to truncate system table {} but it should no longer be being consulted", LEGACY_TRANSFERRED_RANGES, t);
+        }
+    }
+
     public static synchronized void updateTransferredRanges(StreamOperation streamOperation,
                                                          InetAddressAndPort peer,
                                                          String keyspace,
@@ -1872,11 +1892,19 @@ public final class SystemKeyspace
         executeInternal(String.format(cql, TRANSFERRED_RANGES_V2), rangesToUpdate, streamOperation.getDescription(), peer.getAddress(), peer.getPort(), keyspace);
     }
 
-    public static synchronized Map<InetAddressAndPort, Set<Range<Token>>> getTransferredRanges(String description, String keyspace, IPartitioner partitioner)
+    // Only consulted on the decommission path, where the leaving node is the only streamer and its
+    // local transferred_ranges_v2 is therefore a complete record of what has already moved.
+    //
+    // Being node-local rules out the other topology changes. Under removenode the surviving replicas
+    // stream, and the node running it need not be one of them, so its local table may record nothing;
+    // even when it is a replica it can only account for its own streams. Move could use it for the
+    // ranges the moving node gives up, but the move path registers no listener so nothing is recorded,
+    // and it would still miss the ranges moving the other way.
+    public static synchronized Map<InetAddressAndPort, Set<Range<Token>>> getTransferredRanges(StreamOperation streamOperation, String keyspace, IPartitioner partitioner)
     {
         Map<InetAddressAndPort, Set<Range<Token>>> result = new HashMap<>();
         String query = "SELECT * FROM system.%s WHERE operation = ? AND keyspace_name = ?";
-        UntypedResultSet rs = executeInternal(String.format(query, TRANSFERRED_RANGES_V2), description, keyspace);
+        UntypedResultSet rs = executeInternal(String.format(query, TRANSFERRED_RANGES_V2), streamOperation.getDescription(), keyspace);
         for (UntypedResultSet.Row row : rs)
         {
             InetAddress peerAddress = row.getInetAddress("peer");
@@ -2027,7 +2055,7 @@ public final class SystemKeyspace
     public static int loadPreparedStatements(TriFunction<MD5Digest, String, String, Prepared> onLoaded, int pageSize)
     {
         String query = String.format("SELECT prepared_id, logged_keyspace, query_string FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS);
-        UntypedResultSet resultSet = executeOnceInternalWithPaging(query, pageSize);
+        UntypedResultSet resultSet = executeOnceInternalWithPaging(query, PageSize.inRows(pageSize));
         int counter = 0;
 
         // As the cache size may be briefly exceeded before statements are evicted, we allow loading 110% the cache size

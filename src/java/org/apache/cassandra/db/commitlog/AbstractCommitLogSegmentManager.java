@@ -524,9 +524,10 @@ public abstract class AbstractCommitLogSegmentManager
             throw new UncheckedInterruptedException(e);
         }
 
-        for (CommitLogSegment segment : activeSegments)
-            closeAndDeleteSegmentUnsafe(segment, deleteSegments);
-        activeSegments.clear();
+        // Remove before discard, as archiveAndDiscard does, so a segment is never deleted twice
+        CommitLogSegment segment;
+        while ((segment = activeSegments.poll()) != null)
+            discard(segment, deleteSegments);
 
         size.set(0L);
 
@@ -546,26 +547,11 @@ public abstract class AbstractCommitLogSegmentManager
     }
 
     /**
-     * Explicitly for use only during resets in unit testing.
-     */
-    private void closeAndDeleteSegmentUnsafe(CommitLogSegment segment, boolean delete)
-    {
-        try
-        {
-            discard(segment, delete);
-        }
-        catch (AssertionError ignored)
-        {
-            // segment file does not exist
-        }
-    }
-
-    /**
      * Initiates the shutdown process for the management thread.
      */
     public void shutdown()
     {
-        executor.shutdownNow();
+        executor.shutdown();
         // Release the management thread and delete prepared segment.
         // Do not block as another thread may claim the segment (this can happen during unit test initialization).
         discardAvailableSegment();

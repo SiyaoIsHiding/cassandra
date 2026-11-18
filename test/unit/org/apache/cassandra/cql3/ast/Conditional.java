@@ -83,6 +83,11 @@ public interface Conditional extends Expression
                 this.value = value;
             }
 
+            public boolean isEqualityBased()
+            {
+                return this == EQUAL || this == NOT_EQUAL;
+            }
+
             public boolean test(AbstractType<?> type, ByteBuffer a, ByteBuffer b)
             {
                 int rc = type.compare(a, b);
@@ -279,6 +284,98 @@ public interface Conditional extends Expression
         }
     }
 
+    class Like implements Conditional
+    {
+        public final ReferenceExpression ref;
+        public final Expression pattern;
+
+        public Like(ReferenceExpression ref, Expression pattern)
+        {
+            this.ref = ref;
+            this.pattern = pattern;
+        }
+
+        @Override
+        public void toCQL(StringBuilder sb, CQLFormatter formatter)
+        {
+            ref.toCQL(sb, formatter);
+            sb.append(" LIKE ");
+            pattern.toCQL(sb, formatter);
+        }
+
+        @Override
+        public Stream<? extends Element> stream()
+        {
+            return Stream.of(ref, pattern);
+        }
+
+        @Override
+        public Conditional visit(Visitor v)
+        {
+            var u = v.visit(this);
+            if (u != this) return u;
+            var ref = this.ref.visit(v);
+            var pattern = this.pattern.visit(v);
+            if (ref == this.ref && pattern == this.pattern)
+                return this;
+
+            return new Like(ref, pattern);
+        }
+    }
+
+    class Contains implements Conditional
+    {
+        public enum Kind
+        {
+            VALUE("CONTAINS"),
+            KEY("CONTAINS KEY");
+
+            public final String cql;
+
+            Kind(String cql)
+            {
+                this.cql = cql;
+            }
+        }
+
+        public final Kind kind;
+        public final ReferenceExpression ref;
+        public final Expression element;
+
+        public Contains(Kind kind, ReferenceExpression ref, Expression element)
+        {
+            this.kind = kind;
+            this.ref = ref;
+            this.element = element;
+        }
+
+        @Override
+        public void toCQL(StringBuilder sb, CQLFormatter formatter)
+        {
+            ref.toCQL(sb, formatter);
+            sb.append(' ').append(kind.cql).append(' ');
+            element.toCQL(sb, formatter);
+        }
+
+        @Override
+        public Stream<? extends Element> stream()
+        {
+            return Stream.of(ref, element);
+        }
+
+        @Override
+        public Conditional visit(Visitor v)
+        {
+            var u = v.visit(this);
+            if (u != this) return u;
+            var ref = this.ref.visit(v);
+            var element = this.element.visit(v);
+            if (ref == this.ref && element == this.element)
+                return this;
+            return new Contains(kind, ref, element);
+        }
+    }
+
     class And implements Conditional
     {
         public final Conditional left, right;
@@ -412,6 +509,16 @@ public interface Conditional extends Expression
 
         T is(ReferenceExpression ref, Is.Kind kind);
 
+        default T like(ReferenceExpression ref, Expression pattern)
+        {
+            throw new UnsupportedOperationException("LIKE is only supported in SELECT");
+        }
+
+        default T contains(Contains.Kind kind, ReferenceExpression ref, Expression element)
+        {
+            throw new UnsupportedOperationException("CONTAINS is only supported in SELECT");
+        }
+
         @Override
         default T value(ReferenceExpression symbol, Expression e)
         {
@@ -486,6 +593,18 @@ public interface Conditional extends Expression
         public Builder is(ReferenceExpression ref, Is.Kind kind)
         {
             return add(new Is(ref, kind));
+        }
+
+        @Override
+        public Builder like(ReferenceExpression ref, Expression pattern)
+        {
+            return add(new Like(ref, pattern));
+        }
+
+        @Override
+        public Builder contains(Contains.Kind kind, ReferenceExpression ref, Expression element)
+        {
+            return add(new Contains(kind, ref, element));
         }
 
         public Builder is(String ref, Is.Kind kind)

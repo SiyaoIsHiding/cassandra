@@ -24,17 +24,25 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.exceptions.ExceptionCode;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -52,6 +60,7 @@ import org.apache.cassandra.schema.DistributedMetadataLogKeyspace;
 import org.apache.cassandra.schema.ReplicationParams;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.RetryStrategy;
 import org.apache.cassandra.streaming.DataMovement;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.streaming.StreamOperation;
@@ -64,6 +73,7 @@ import org.apache.cassandra.tcm.MultiStepOperation;
 import org.apache.cassandra.tcm.Retry;
 import org.apache.cassandra.tcm.Transformation;
 import org.apache.cassandra.tcm.membership.Directory;
+import org.apache.cassandra.tcm.membership.EndpointLookup;
 import org.apache.cassandra.tcm.membership.NodeId;
 import org.apache.cassandra.tcm.ownership.MovementMap;
 import org.apache.cassandra.tcm.serialization.AsymmetricMetadataSerializer;
@@ -74,8 +84,10 @@ import org.apache.cassandra.tcm.transformations.cms.PrepareCMSReconfiguration;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Future;
 
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.locator.MetaStrategy.entireRange;
 import static org.apache.cassandra.streaming.StreamOperation.RESTORE_REPLICA_COUNT;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * This class is slightly different from most other MultiStepOperations in that it doesn't reify every component
@@ -149,7 +161,11 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
     @Override
     public Set<NodeId> affectedPeers(Directory directory)
     {
-        return Set.of();
+        Set<NodeId> affected = new HashSet<>(next.diff.additions);
+        affected.addAll(next.diff.removals);
+        if (next.activeTransition != null)
+            affected.add(next.activeTransition.nodeId);
+        return affected;
     }
 
     @Override
@@ -190,7 +206,7 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
                 ActiveTransition activeTransition = transitionCMS.next.activeTransition;
                 InetAddressAndPort endpoint = metadata.directory.endpoint(activeTransition.nodeId);
                 Replica replica = new Replica(endpoint, entireRange, true);
-                streamRanges(replica, activeTransition.streamCandidates);
+                streamRanges(replica, activeTransition.streamCandidates(metadata.directory));
             }
             else
             {
@@ -227,23 +243,76 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
                                    MetaStrategy.affectedRanges(metadata));
     }
 
-    public static void maybeReconfigureCMS(ClusterMetadata metadata, InetAddressAndPort toRemove)
+    public static ClusterMetadata maybeReconfigureCMS(ClusterMetadata metadata, InetAddressAndPort toRemove)
+    {
+        return maybeReconfigureCMS(metadata, toRemove, m -> m.inProgressSequences.get(SequenceKey.instance));
+    }
+
+    @VisibleForTesting
+    public static ClusterMetadata maybeReconfigureCMS(ClusterMetadata metadata,
+                                                      InetAddressAndPort toRemove,
+                                                      Function<ClusterMetadata, MultiStepOperation<?>> inProgressReconfiguration)
     {
         if (!metadata.fullCMSMembers().contains(toRemove))
-            return;
-        Set<NodeId> downNodes = new HashSet<>();
-        for (InetAddressAndPort ep : metadata.directory.allJoinedEndpoints())
-            if (!FailureDetector.instance.isAlive(ep))
-                downNodes.add(metadata.directory.peerId(ep));
+            return metadata;
 
-        PrepareCMSReconfiguration.Simple transformation = new PrepareCMSReconfiguration.Simple(metadata.directory.peerId(toRemove), downNodes);
-        transformation.verify(metadata);
-        // We can force removal from the CMS as it doesn't alter the size of the service
-        ClusterMetadataService.instance().commit(transformation);
+        long deadlineNanos = nanoTime() + DatabaseDescriptor.getCmsReconfigurationWaitTimeout().to(NANOSECONDS);
+        RetryStrategy backoffWithJitter = DatabaseDescriptor.getCmsCommitRetryStrategy();
+        Retry retry = Retry.until(deadlineNanos, TCMMetrics.instance.cmsReconfigurationRetries, backoffWithJitter);
+        MultiStepOperation<?> inProgress = null;
+        ClusterMetadata current = metadata;
+        while (!retry.hasExpired())
+        {
+            if (!current.fullCMSMembers().contains(toRemove))
+                return current;
 
-        InProgressSequences.finishInProgressSequences(SequenceKey.instance);
-        if (ClusterMetadata.current().isCMSMember(toRemove))
-            throw new IllegalStateException(String.format("Could not remove %s from CMS", toRemove));
+            inProgress = inProgressReconfiguration.apply(current);
+            if (inProgress != null)
+            {
+                logger.info("Deferring CMS reconfiguration to remove {} until in-progress reconfiguration {} completes ({}ms remaining before giving up)",
+                            toRemove, inProgress, NANOSECONDS.toMillis(retry.remainingNanos()));
+                retry.maybeSleep();
+                current = ClusterMetadata.current();
+            }
+            else
+            {
+                Set<NodeId> downNodes = new HashSet<>();
+                for (InetAddressAndPort ep : current.directory.allJoinedEndpoints())
+                    if (!FailureDetector.instance.isAlive(ep))
+                        downNodes.add(current.directory.peerId(ep));
+
+                PrepareCMSReconfiguration.Simple transformation = new PrepareCMSReconfiguration.Simple(current.directory.peerId(toRemove), downNodes);
+                transformation.verify(current);
+
+                AtomicReference<ExceptionCode> failureCode = new AtomicReference<>();
+                AtomicReference<String> failureMessage = new AtomicReference<>();
+                // We can force removal from the CMS as it doesn't alter the size of the service
+                current = ClusterMetadataService.instance().commit(transformation,
+                                                                   m -> m,
+                                                                   (code, message) -> {
+                                                                     failureCode.set(code);
+                                                                     failureMessage.set(message);
+                                                                     return null;
+                                                                   });
+                if (current != null)
+                {
+                    current = InProgressSequences.finishInProgressSequences(SequenceKey.instance);
+                    if (current.isCMSMember(toRemove))
+                        throw new IllegalStateException(String.format("Could not remove %s from CMS", toRemove));
+                    return current;
+                }
+
+                current = ClusterMetadata.current();
+                inProgress = inProgressReconfiguration.apply(current);
+                if (inProgress == null)
+                    throw new IllegalStateException(String.format("Can not commit transformation to remove %s from the CMS: \"%s\"(%s).",
+                                                                    toRemove, failureCode.get(), failureMessage.get()));
+            }
+        }
+
+        throw new IllegalStateException(String.format("Timed out after %s waiting to reconfigure the CMS to remove %s: " +
+                                                        "another CMS reconfiguration (%s) is in progress.",
+                                                        DatabaseDescriptor.getCmsReconfigurationWaitTimeout(), toRemove, inProgress));
     }
 
     private static void initiateRemoteStreaming(Replica replicaForStreaming, Set<InetAddressAndPort> streamCandidates)
@@ -394,13 +463,39 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
 
     public static class ActiveTransition
     {
-        public final NodeId nodeId;
-        public final Set<InetAddressAndPort> streamCandidates;
+        public static final Serializer serializer = new Serializer();
 
-        public ActiveTransition(NodeId nodeId, Set<InetAddressAndPort> streamCandidates)
+        public final NodeId nodeId;
+        private final Set<NodeId> streamCandidates;
+        private final Set<InetAddressAndPort> streamCandidateEndpoints;
+
+        private ActiveTransition(NodeId nodeId, Set<NodeId> streamCandidates, Set<InetAddressAndPort> streamCandidateEndpoints)
         {
             this.nodeId = nodeId;
-            this.streamCandidates = Collections.unmodifiableSet(streamCandidates);
+            this.streamCandidateEndpoints = streamCandidateEndpoints == null ? null : Collections.unmodifiableSet(streamCandidateEndpoints);
+            this.streamCandidates = streamCandidates == null ? null : Collections.unmodifiableSet(streamCandidates);
+        }
+
+        public static ActiveTransition withEndpoints(NodeId nodeId, Set<InetAddressAndPort> streamCandidateEndpoints)
+        {
+            return new ActiveTransition(nodeId, null, streamCandidateEndpoints);
+        }
+
+        public static ActiveTransition withNodeIds(NodeId nodeId, Set<NodeId> streamCandidates)
+        {
+            return new ActiveTransition(nodeId, streamCandidates, null);
+        }
+
+        public Set<InetAddressAndPort> streamCandidates(EndpointLookup epLookup)
+        {
+            if (streamCandidateEndpoints != null)
+                return streamCandidateEndpoints;
+            Set<InetAddressAndPort> candidates = streamCandidates.stream().map(epLookup::endpoint).filter(Objects::nonNull).collect(Collectors.toSet());
+            if (candidates.isEmpty())
+                throw new IllegalStateException("Could not resolve any streamCandidates node ids to endpoints: " + streamCandidates);
+            if (candidates.size() != streamCandidates.size())
+                logger.warn("Could not resolve all streamCandidates to endpoints: {} {}", candidates, streamCandidates);
+            return candidates;
         }
 
         @Override
@@ -408,8 +503,112 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
         {
             return "ActiveTransition{" +
                    "nodeId=" + nodeId +
+                   ", streamCandidateEndpoints=" + streamCandidateEndpoints +
                    ", streamCandidates=" + streamCandidates +
                    '}';
+        }
+
+        public static class Serializer implements MetadataSerializer<ActiveTransition>
+        {
+            @Override
+            public void serialize(ActiveTransition activeTransition, DataOutputPlus out, Version version) throws IOException
+            {
+                NodeId.serializer.serialize(activeTransition.nodeId, out, version);
+                assert activeTransition.streamCandidates == null ^ activeTransition.streamCandidateEndpoints == null;
+                if (version.isBefore(Version.V10))
+                {
+                    assert activeTransition.streamCandidateEndpoints != null;
+                    out.writeInt(activeTransition.streamCandidateEndpoints.size());
+                    for (InetAddressAndPort e : activeTransition.streamCandidateEndpoints)
+                        InetAddressAndPort.MetadataSerializer.serializer.serialize(e, out, version);
+                }
+                else
+                {
+                    // we might reserialize a V9 ActiveTransition as V10 when a node is catching up, so we need to handle both cases here
+                    if (activeTransition.streamCandidates != null)
+                    {
+                        out.writeBoolean(true);
+                        out.writeUnsignedVInt32(activeTransition.streamCandidates.size());
+                        for (NodeId nodeId : activeTransition.streamCandidates)
+                            NodeId.serializer.serialize(nodeId, out, version);
+                    }
+                    else
+                    {
+                        out.writeBoolean(false);
+                        out.writeUnsignedVInt32(activeTransition.streamCandidateEndpoints.size());
+                        for (InetAddressAndPort e : activeTransition.streamCandidateEndpoints)
+                            InetAddressAndPort.MetadataSerializer.serializer.serialize(e, out, version);
+                    }
+                }
+            }
+
+            @Override
+            public ActiveTransition deserialize(DataInputPlus in, Version version) throws IOException
+            {
+                NodeId nodeId = NodeId.serializer.deserialize(in, version);
+                if (version.isBefore(Version.V10))
+                {
+                    return deserializeOld(nodeId, in.readInt(), in, version);
+                }
+                else
+                {
+                    boolean hasNodeIdCandidates = in.readBoolean();
+                    int streamCandidatesCount = in.readUnsignedVInt32();
+                    if (hasNodeIdCandidates)
+                    {
+                        Set<NodeId> candidates = new HashSet<>();
+                        for (int i = 0; i < streamCandidatesCount; i++)
+                            candidates.add(NodeId.serializer.deserialize(in, version));
+                        return ReconfigureCMS.ActiveTransition.withNodeIds(nodeId, candidates);
+                    }
+                    else
+                    {
+                        logger.debug("Deserialized V9-serialized streamCandidates in V10");
+                        return deserializeOld(nodeId, streamCandidatesCount, in, version);
+                    }
+                }
+            }
+
+            private static ActiveTransition deserializeOld(NodeId nodeId, int streamCandidatesCount, DataInputPlus in, Version version) throws IOException
+            {
+                Set<InetAddressAndPort> streamCandidates = new HashSet<>();
+                for (int i = 0; i < streamCandidatesCount; i++)
+                    streamCandidates.add(InetAddressAndPort.MetadataSerializer.serializer.deserialize(in, version));
+                return ReconfigureCMS.ActiveTransition.withEndpoints(nodeId, streamCandidates);
+            }
+
+            @Override
+            public long serializedSize(ActiveTransition activeTransition, Version version)
+            {
+                assert activeTransition.streamCandidates == null ^ activeTransition.streamCandidateEndpoints == null;
+                long size = 0;
+                size += NodeId.serializer.serializedSize(activeTransition.nodeId, version);
+                if (version.isBefore(Version.V10))
+                {
+                    assert activeTransition.streamCandidateEndpoints != null;
+                    size += TypeSizes.INT_SIZE;
+                    for (InetAddressAndPort e : activeTransition.streamCandidateEndpoints)
+                        size += InetAddressAndPort.MetadataSerializer.serializer.serializedSize(e, version);
+                }
+                else
+                {
+                    if (activeTransition.streamCandidates != null)
+                    {
+                        size += TypeSizes.sizeofUnsignedVInt(activeTransition.streamCandidates.size());
+                        size += TypeSizes.BOOL_SIZE;
+                        for (NodeId nodeId : activeTransition.streamCandidates)
+                            size += NodeId.serializer.serializedSize(nodeId, version);
+                    }
+                    else
+                    {
+                        size += TypeSizes.sizeofUnsignedVInt(activeTransition.streamCandidateEndpoints.size());
+                        size += TypeSizes.BOOL_SIZE;
+                        for (InetAddressAndPort e : activeTransition.streamCandidateEndpoints)
+                            size += InetAddressAndPort.MetadataSerializer.serializer.serializedSize(e, version);
+                    }
+                }
+                return size;
+            }
         }
     }
 

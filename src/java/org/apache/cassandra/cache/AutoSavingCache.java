@@ -110,7 +110,7 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
     {
         private final SequentialWriterOption writerOption = SequentialWriterOption.newBuilder()
                                                                     .trickleFsync(DatabaseDescriptor.getTrickleFsync())
-                                                                    .trickleFsyncByteInterval(DatabaseDescriptor.getTrickleFsyncIntervalInKiB() * 1024)
+                                                                    .trickleFsyncByteInterval(DatabaseDescriptor.getTrickleFsyncIntervalInBytes())
                                                                     .finishOnClose(true).build();
 
         public DataInputStreamPlus getInputStream(File dataPath, File crcPath) throws IOException
@@ -393,6 +393,7 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
                 }
 
                 cacheLoader.serializeMetadata(metadataWriter);
+                metadataWriter.flush();
                 metadataWriter.sync();
             }
             catch (FileNotFoundException | NoSuchFileException e)

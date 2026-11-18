@@ -24,7 +24,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.concurrent.locks.Lock;
@@ -40,6 +39,7 @@ import com.google.common.collect.ImmutableSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
@@ -61,12 +61,9 @@ import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.IScrubber;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableRewriter;
-import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.RandomAccessReader;
@@ -155,30 +152,13 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
         // partition header (key or data size) is corrupt. (This means our position in the index file will be one
         // partition "ahead" of the data file.)
         this.dataFile = transaction.isOffline()
-                        ? sstable.openDataReader()
-                        : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
+                        ? sstable.openDataReaderForScan(DatabaseDescriptor.getCompactionReadDiskAccessMode())
+                        : sstable.openDataReaderForScan(DatabaseDescriptor.getCompactionReadDiskAccessMode(), CompactionManager.instance.getRateLimiter());
 
         this.scrubInfo = new ScrubInfo(dataFile, sstable, fileAccessLock.readLock());
 
         if (options.reinsertOverflowedTTLRows)
             outputHandler.output("Starting scrub with reinsert overflowed TTL option");
-    }
-
-    public static void deleteOrphanedComponents(Descriptor descriptor, Set<Component> components)
-    {
-        File dataFile = descriptor.fileFor(Components.DATA);
-        if (components.contains(Components.DATA) && dataFile.length() > 0)
-            // everything appears to be in order... moving on.
-            return;
-
-        // missing the DATA file! all components are orphaned
-        logger.warn("Removing orphans for {}: {}", descriptor, components);
-        for (Component component : components)
-        {
-            File file = descriptor.fileFor(component);
-            if (file.exists())
-                descriptor.fileFor(component).delete();
-        }
     }
 
     @Override

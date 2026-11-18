@@ -20,20 +20,17 @@ package org.apache.cassandra.io.compress;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.time.Duration;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import javax.annotation.Nullable;
 
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.luben.zstd.Zstd;
+import com.github.luben.zstd.ZstdCompressCtx;
+import com.github.luben.zstd.ZstdDecompressCtx;
 import com.google.common.annotations.VisibleForTesting;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.compression.CompressionDictionary.Kind;
 import org.apache.cassandra.db.compression.CompressionDictionaryTrainingConfig;
@@ -43,27 +40,10 @@ import org.apache.cassandra.utils.concurrent.Ref;
 public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICompressor, IDictionaryCompressor<ZstdCompressionDictionary>
 {
     private static final ConcurrentHashMap<Integer, ZstdDictionaryCompressor> instancesPerLevel = new ConcurrentHashMap<>();
-    private static final Cache<ZstdCompressionDictionary, ZstdDictionaryCompressor> instancePerDict =
-    Caffeine.newBuilder()
-            .maximumSize(DatabaseDescriptor.getCompressionDictionaryCacheSize())
-            .expireAfterAccess(Duration.ofSeconds(DatabaseDescriptor.getCompressionDictionaryCacheExpireSeconds()))
-            .removalListener((ZstdCompressionDictionary dictionary,
-                              ZstdDictionaryCompressor compressor,
-                              RemovalCause cause) -> {
-                // Release dictionary reference when compressor is evicted from cache
-                if (compressor != null && compressor.dictionaryRef != null)
-                {
-                    compressor.dictionaryRef.release();
-                }
-            })
-            .build();
 
-    // dictionary and its ref are null, when they are absent.
-    // In this case, the compressor falls back to be the same as ZstdCompressor
+    // dictionary is null when it is absent. In this case, the compressor falls back to be the same as ZstdCompressor
     @Nullable
     private final ZstdCompressionDictionary dictionary;
-    @Nullable
-    private final Ref<ZstdCompressionDictionary> dictionaryRef;
 
     /**
      * Create a ZstdDictionaryCompressor with the given options
@@ -89,6 +69,10 @@ public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICom
         return getOrCreate(DEFAULT_COMPRESSION_LEVEL, dictionary);
     }
 
+    // The compressor for a dictionary and level is cached on the dictionary instance itself (see
+    // ZstdCompressionDictionary.getOrCreateCompressor), so its lifetime is tied to that instance: it can never be
+    // handed out for a dictionary object other than the one passed in, and it never outlives the dictionary object,
+    // unlike a compressor kept in a cache independent of the dictionary's own lifecycle.
     private static ZstdDictionaryCompressor getOrCreate(int level, ZstdCompressionDictionary dictionary)
     {
         if (dictionary == null)
@@ -96,30 +80,21 @@ public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICom
             return instancesPerLevel.computeIfAbsent(level, ZstdDictionaryCompressor::new);
         }
 
-        return instancePerDict.get(dictionary, dict -> {
-            // Get a reference to the dictionary when creating new compressor
-            Ref<ZstdCompressionDictionary> ref = dict.tryRef();
-            if (ref == null)
-            {
-                throw new IllegalStateException("Dictionary is released");
-            }
-            return new ZstdDictionaryCompressor(level, dictionary, ref);
-        });
+        return dictionary.getOrCreateCompressor(level, lvl -> new ZstdDictionaryCompressor(lvl, dictionary));
     }
 
     private ZstdDictionaryCompressor(int level)
     {
-        this(level, null, null);
+        this(level, null);
     }
 
-    private ZstdDictionaryCompressor(int level, ZstdCompressionDictionary dictionary, Ref<ZstdCompressionDictionary> dictionaryRef)
+    private ZstdDictionaryCompressor(int level, ZstdCompressionDictionary dictionary)
     {
         super(level, Set.of(COMPRESSION_LEVEL_OPTION_NAME,
                             TRAINING_MAX_DICTIONARY_SIZE_PARAMETER_NAME,
                             TRAINING_MAX_TOTAL_SAMPLE_SIZE_PARAMETER_NAME,
                             TRAINING_MIN_FREQUENCY_PARAMETER_NAME));
         this.dictionary = dictionary;
-        this.dictionaryRef = dictionaryRef;
     }
 
     @Override
@@ -143,22 +118,46 @@ public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICom
             return super.uncompress(input, inputOffset, inputLength, output, outputOffset);
         }
 
-        int dsz;
+        // Hold our own reference for the duration of the call: the caller's own reference can be released by
+        // another thread concurrently with this call, and tidy() must not run while a context is still in use.
+        Ref<ZstdCompressionDictionary> ref = dictionary.tryRef();
+        if (ref == null)
+            throw new IOException("Dictionary is released");
+
+        ZstdDecompressCtx ctx = null;
+        boolean ok = false;
         try
         {
-            dsz = (int) Zstd.decompressFastDict(output, outputOffset,
-                                                input, inputOffset, inputLength,
-                                                dictionary.dictionaryForDecompression());
+            // Reuse a pooled context (dictionary loaded once) rather than the static one-shot, which allocates a
+            // fresh ZSTD_DCtx per call.
+            ctx = dictionary.acquireDecompressCtx();
+            int dsz = ctx.decompressByteArray(output, outputOffset, output.length - outputOffset,
+                                              input, inputOffset, inputLength);
+            if (Zstd.isError(dsz))
+                throw new IOException("Decompression failed due to " + Zstd.getErrorName(dsz));
+            ok = true;
+            return dsz;
+        }
+        catch (IOException e)
+        {
+            throw e;
         }
         catch (Exception e)
         {
             throw new IOException("Decompression failed", e);
         }
-
-        if (Zstd.isError(dsz))
-            throw new IOException("Decompression failed due to " + Zstd.getErrorName(dsz));
-
-        return dsz;
+        finally
+        {
+            // success -> return to pool; failure -> close, so a context that errored is never reused
+            if (ctx != null)
+            {
+                if (ok)
+                    dictionary.releaseDecompressCtx(ctx);
+                else
+                    ctx.close();
+            }
+            ref.release();
+        }
     }
 
     @Override
@@ -170,18 +169,38 @@ public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICom
             return;
         }
 
+        Ref<ZstdCompressionDictionary> ref = dictionary.tryRef();
+        if (ref == null)
+            throw new IOException("Dictionary is released");
+
+        ZstdDecompressCtx ctx = null;
+        boolean ok = false;
         try
         {
-            // Zstd compressors expect only direct bytebuffer. See ZstdCompressorBase.preferredBufferType and supports
-            int decompressedSize = (int) Zstd.decompressDirectByteBufferFastDict(output, output.position(), output.limit() - output.position(),
-                                                                                 input, input.position(), input.limit() - input.position(),
-                                                                                 dictionary.dictionaryForDecompression());
+            // Zstd compressors expect only direct bytebuffer. See ZstdCompressorBase.preferredBufferType and supports.
+            // The context carries the dictionary (loaded once) and is reused across chunks.
+            ctx = dictionary.acquireDecompressCtx();
+            int decompressedSize = ctx.decompressDirectByteBuffer(output, output.position(), output.limit() - output.position(),
+                                                                  input, input.position(), input.limit() - input.position());
             output.position(output.position() + decompressedSize);
             input.position(input.limit());
+            ok = true;
         }
         catch (Exception e)
         {
             throw new IOException("Decompression failed", e);
+        }
+        finally
+        {
+            // success -> return to pool; failure -> close, so a context that errored is never reused
+            if (ctx != null)
+            {
+                if (ok)
+                    dictionary.releaseDecompressCtx(ctx);
+                else
+                    ctx.close();
+            }
+            ref.release();
         }
     }
 
@@ -194,18 +213,38 @@ public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICom
             return;
         }
 
+        Ref<ZstdCompressionDictionary> ref = dictionary.tryRef();
+        if (ref == null)
+            throw new IOException("Dictionary is released");
+
+        ZstdCompressCtx ctx = null;
+        boolean ok = false;
         try
         {
-            // Zstd compressors expect only direct bytebuffer. See ZstdCompressorBase.preferredBufferType and supports
-            int compressedSize = (int) Zstd.compressDirectByteBufferFastDict(output, output.position(), output.limit() - output.position(),
-                                                                             input, input.position(), input.limit() - input.position(),
-                                                                             dictionary.dictionaryForCompression(compressionLevel()));
+            // Zstd compressors expect only direct bytebuffer. See ZstdCompressorBase.preferredBufferType and supports.
+            // The context carries the dictionary (loaded once) and is reused across chunks.
+            ctx = dictionary.acquireCompressCtx(compressionLevel());
+            int compressedSize = ctx.compressDirectByteBuffer(output, output.position(), output.limit() - output.position(),
+                                                             input, input.position(), input.limit() - input.position());
             output.position(output.position() + compressedSize);
             input.position(input.limit());
+            ok = true;
         }
         catch (Exception e)
         {
             throw new IOException("Compression failed", e);
+        }
+        finally
+        {
+            // success -> return to pool; failure -> close, so a context that errored is never reused
+            if (ctx != null)
+            {
+                if (ok)
+                    dictionary.releaseCompressCtx(compressionLevel(), ctx);
+                else
+                    ctx.close();
+            }
+            ref.release();
         }
     }
 
@@ -213,12 +252,5 @@ public class ZstdDictionaryCompressor extends ZstdCompressorBase implements ICom
     ZstdCompressionDictionary dictionary()
     {
         return dictionary;
-    }
-
-    @VisibleForTesting
-    public static void invalidateCache()
-    {
-        instancePerDict.invalidateAll();
-        instancePerDict.cleanUp();
     }
 }

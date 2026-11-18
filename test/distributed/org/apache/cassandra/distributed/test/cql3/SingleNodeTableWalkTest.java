@@ -25,6 +25,7 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.NavigableSet;
 import java.util.Optional;
 import java.util.TreeMap;
@@ -46,6 +47,7 @@ import accord.utils.RandomSource;
 
 import org.apache.cassandra.cql3.KnownIssue;
 import org.apache.cassandra.cql3.ast.Bind;
+import org.apache.cassandra.cql3.ast.Conditional;
 import org.apache.cassandra.cql3.ast.Conditional.Where.Inequality;
 import org.apache.cassandra.cql3.ast.CreateIndexDDL;
 import org.apache.cassandra.cql3.ast.FunctionCall;
@@ -55,9 +57,12 @@ import org.apache.cassandra.cql3.ast.Select;
 import org.apache.cassandra.cql3.ast.Symbol;
 import org.apache.cassandra.cql3.ast.TableReference;
 import org.apache.cassandra.cql3.ast.Value;
+import org.apache.cassandra.cql3.restrictions.LikePattern;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.InetAddressType;
+import org.apache.cassandra.db.marshal.StringType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.distributed.Cluster;
@@ -93,6 +98,14 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
                                                                                                                          .stream()
                                                                                                                          .filter(t -> !AbstractTypeGenerators.isUnsafeEquality(t))
                                                                                                                          .collect(Collectors.toList()));
+    private static final String SHARDS = "shards";
+    @SuppressWarnings("unchecked")
+    private static final Map<String, String>[] SHARD_OPTIONS = new Map[] {
+        Collections.emptyMap(),
+        Collections.singletonMap(SHARDS, "1"),
+        Collections.singletonMap(SHARDS, "4"),
+        Collections.singletonMap(SHARDS, "auto")
+    };
     private static final Logger logger = LoggerFactory.getLogger(SingleNodeTableWalkTest.class);
 
     protected static boolean READ_AFTER_WRITE = false;
@@ -125,6 +138,18 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
         return AbstractTypeGenerators.builder()
                                      .withTypeKinds(TypeKind.PRIMITIVE)
                                      .withPrimitives(Generators.fromGen(PRIMITIVE_DISTRIBUTION.next(rs)));
+    }
+
+    protected TypeGenBuilder supportedClusteringColumnTypes(RandomSource rs)
+    {
+        // primary key columns don't support a type kind generator, so randomly allow collections (frozen when used in the primary key)
+        TypeKind[] kinds = rs.nextBoolean()
+                            ? new TypeKind[]{ TypeKind.PRIMITIVE }
+                            : new TypeKind[]{ TypeKind.PRIMITIVE, TypeKind.SET, TypeKind.LIST, TypeKind.MAP };
+        return AbstractTypeGenerators.builder()
+                                     .withTypeKinds(kinds)
+                                     .withPrimitives(Generators.fromGen(PRIMITIVE_DISTRIBUTION.next(rs)))
+                                     .withMaxDepth(0);
     }
 
     protected List<CreateIndexDDL.Indexer> supportedIndexers()
@@ -330,6 +355,74 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
         return state.command(rs, select, annotate);
     }
 
+    /**
+     * Searches a collection column with {@code CONTAINS}, {@code CONTAINS KEY}, or {@code =} (frozen only), and when
+     * possible also restricts an indexed column so the index drives the query and the collection is filtered.
+     */
+    public Property.Command<State, Void, ?> collectionQuery(RandomSource rs, State state)
+    {
+        Symbol symbol = rs.pick(state.collectionColumns);
+        NavigableSet<ByteBuffer> allowed = Sets.filter(state.model.index(symbol).navigableKeySet(), ByteBuffer::hasRemaining);
+        if (allowed.isEmpty())
+            return Property.ignoreCommand();
+        ByteBuffer collection = rs.pickOrderedSet(allowed);
+        CollectionType<?> type = (CollectionType<?>) symbol.type().unwrap();
+
+        // maps are serialized as key1, value1, key2, value2, ...
+        List<ByteBuffer> elements = type.unpack(collection);
+        List<Conditional.Contains.Kind> containsKinds = new ArrayList<>(2);
+        // CONTAINS on a DESC clustering column is rejected as the type is ReversedType, see CASSANDRA-21742
+        if (!elements.isEmpty() && !symbol.reversed)
+        {
+            containsKinds.add(Conditional.Contains.Kind.VALUE);
+            if (type.kind == CollectionType.Kind.MAP)
+                containsKinds.add(Conditional.Contains.Kind.KEY);
+        }
+        if (containsKinds.isEmpty() && type.isMultiCell())
+            return Property.ignoreCommand();
+        boolean eq = !type.isMultiCell() && (containsKinds.isEmpty() || rs.decide(0.33f));
+
+        Select.Builder builder = Select.builder().table(state.metadata).allowFiltering();
+        String annotate;
+        if (eq)
+        {
+            builder.value(symbol, collection);
+            annotate = "=";
+        }
+        else
+        {
+            Conditional.Contains.Kind kind = rs.pick(containsKinds);
+            int step = type.kind == CollectionType.Kind.MAP ? 2 : 1;
+            int offset = type.kind == CollectionType.Kind.MAP && kind == Conditional.Contains.Kind.VALUE ? 1 : 0;
+            ByteBuffer element = elements.get(rs.nextInt(0, elements.size() / step) * step + offset);
+            AbstractType<?> elementType = kind == Conditional.Contains.Kind.KEY || type.kind == CollectionType.Kind.SET
+                                           ? type.nameComparator()
+                                           : type.valueComparator();
+            builder.contains(kind, symbol, state.value(rs, element, elementType));
+            annotate = kind.cql;
+        }
+        annotate = "collection " + annotate + " on " + symbol.detailedName() + indexedAnnotation(state, symbol);
+
+        List<Symbol> indexed = state.collectionQueryIndexedColumns.stream().filter(s -> !s.equals(symbol)).collect(Collectors.toList());
+        if (!indexed.isEmpty())
+        {
+            Symbol other = rs.pick(indexed);
+            NavigableSet<ByteBuffer> otherAllowed = Sets.filter(state.model.index(other).navigableKeySet(), ByteBuffer::hasRemaining);
+            if (!otherAllowed.isEmpty())
+            {
+                builder.value(other, rs.pickOrderedSet(otherAllowed));
+                annotate += ", with " + other.detailedName() + indexedAnnotation(state, other);
+            }
+        }
+        return state.command(rs, builder.build(), annotate);
+    }
+
+    private static String indexedAnnotation(State state, Symbol symbol)
+    {
+        var indexed = state.indexes.get(symbol);
+        return indexed == null ? "" : " (indexed with " + indexed.indexDDL.indexer.name() + ')';
+    }
+
     private Property.Command<State, Void, ?> simpleRangeSearch(RandomSource rs, State state, Symbol symbol, ByteBuffer value, Select.Builder builder)
     {
         // do a simple search, like > or <
@@ -421,6 +514,58 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
         return state.command(rs, select, annotation);
     }
 
+    public Property.Command<State, Void, ?> likeQuery(RandomSource rs, State state)
+    {
+        Symbol symbol = rs.pick(state.searchableTextColumns);
+        TreeMap<ByteBuffer, List<BytesPartitionState.PrimaryKey>> universe = state.model.index(symbol);
+
+        NavigableSet<ByteBuffer> allowed = Sets.filter(universe.navigableKeySet(),
+                                                      b -> {
+                                                          String s = symbol.type().getString(b);
+                                                          return !s.contains("%") && !ByteBufferUtil.EMPTY_BYTE_BUFFER.equals(b);
+                                                      });
+
+        if (allowed.isEmpty())
+            return Property.ignoreCommand();
+
+        ByteBuffer value = rs.pickOrderedSet(allowed);
+        String valueStr = symbol.type().getString(value);
+        String pattern;
+
+        LikePattern.Kind kind = rs.pick(LikePattern.Kind.values());
+        switch (kind)
+        {
+            case PREFIX:
+                int prefixLen = rs.nextInt(1, valueStr.length() + 1);
+                pattern = valueStr.substring(0, prefixLen) + "%";
+                break;
+
+            case SUFFIX:
+                int suffixLen = rs.nextInt(1, valueStr.length() + 1);
+                pattern = "%" + valueStr.substring(valueStr.length() - suffixLen);
+                break;
+
+            case CONTAINS:
+                int begin = rs.nextInt(0, valueStr.length());
+                int end   = rs.nextInt(begin + 1, valueStr.length() + 1);
+                pattern = "%" + valueStr.substring(begin, end) + "%";
+                break;
+
+            case MATCHES:
+                pattern = valueStr;
+                break;
+
+            default:
+                throw new IllegalStateException("Unhandled LIKE kind: " + kind);
+        }
+
+        Select.Builder builder = Select.builder().table(state.metadata);
+        builder.allowFiltering();
+        builder.like(symbol, new Bind(pattern, symbol.type()));
+        Select select = builder.build();
+        return state.command(rs, select, "LIKE query on " + symbol.detailedName());
+    }
+
     protected State createState(RandomSource rs, Cluster cluster)
     {
         return new State(rs, cluster);
@@ -456,6 +601,8 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
                                   .addIf(State::allowNonPartitionMultiColumnQuery, this::multiColumnQuery)
                                   .addIf(State::allowPartitionQuery, this::partitionRestrictedQuery)
                                   .addIf(State::allowClusteringBetweenQuery, this::clusteringBetweenQuery)
+                                  .addIf(State::allowLikeQuery, this::likeQuery)
+                                  .addIf(State::allowCollectionQuery, this::collectionQuery)
                                   .destroyState(State::close)
                                   .commandsTransformer(LoggingCommand.factory())
                                   .onSuccess(onSuccess(logger))
@@ -477,7 +624,8 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
                      .withKeyspaceName(ks).withTableName("tbl")
                      .withSimpleColumnNames()
                      .withDefaultTypeGen(supportedTypes(rs))
-                     .withPrimaryColumnTypeGen(supportedPrimaryColumnTypes(rs))
+                     .withPartitionColumnTypeGen(supportedPrimaryColumnTypes(rs))
+                     .withClusteringColumnTypeGen(supportedClusteringColumnTypes(rs))
                      .withPartitioner(Murmur3Partitioner.instance)
                      .build())
                .next(rs);
@@ -510,6 +658,9 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
         private final List<Symbol> searchableNonPartitionColumns;
         private final List<Symbol> searchableColumns;
         private final List<Symbol> nonPkIndexedColumns;
+        private final List<Symbol> searchableTextColumns;
+        private final List<Symbol> collectionColumns;
+        private final List<Symbol> collectionQueryIndexedColumns;
 
         public State(RandomSource rs, Cluster cluster)
         {
@@ -577,6 +728,18 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
                                 .stream()
                                 .filter(this::isSearchable)
                                 .collect(Collectors.toList());
+
+            searchableTextColumns = model.factory.selectionOrder
+                                    .stream()
+                                    .filter(this::supportsLike)
+                                    .collect(Collectors.toList());
+
+            collectionColumns = nonPartitionColumns.stream()
+                                                   .filter(s -> s.type().unwrap().isCollection())
+                                                   .collect(Collectors.toList());
+            collectionQueryIndexedColumns = nonPkIndexedColumns.stream()
+                                                               .filter(s -> !(s.type().isVector() && IGNORED_ISSUES.contains(KnownIssue.SAI_AND_VECTOR_COLUMNS)))
+                                                               .collect(Collectors.toList());
         }
 
         @Override
@@ -598,6 +761,12 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
             return !(symbol.type().isMultiCell() && (symbol.type().isCollection() || symbol.type().isUDT()));
         }
 
+        private boolean supportsLike(Symbol symbol)
+        {
+            AbstractType<?> type = symbol.type();
+            return type instanceof StringType;
+        }
+
         @Override
         protected Gen<Mutation> mutationGen()
         {
@@ -610,8 +779,11 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
             // for some test runs, avoid using indexes
             if (rs.nextBoolean())
                 return indexed;
+            // index a subset of the columns, so queries can mix indexed and non-indexed columns
+            Gen<Boolean> indexColumn = BOOLEAN_DISTRIBUTION.next(rs);
             for (ColumnMetadata col : metadata.columnsInFixedOrder())
             {
+                if (!indexColumn.next(rs)) continue;
                 Symbol symbol = Symbol.from(col);
                 AbstractType<?> type = symbol.type();
 
@@ -628,12 +800,18 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
                     colExpression = new CreateIndexDDL.CollectionReference(CreateIndexDDL.CollectionReference.Kind.FULL, colExpression);
 
                 String name = "tbl_" + col.name;
+
+                Map<String, String> indexOptions = Collections.emptyMap();
+                // If indexer is of Kind SAI, we want to randomize shards for testing the ShardedMemtableIndex implementation.
+                if (indexer.kind() == CreateIndexDDL.Indexer.Kind.sai )
+                    indexOptions = rs.pick(SHARD_OPTIONS);
+
                 CreateIndexDDL ddl = new CreateIndexDDL(rs.pick(CreateIndexDDL.Version.values()),
                                                         indexer,
                                                         Optional.of(new Symbol(name, UTF8Type.instance)),
                                                         TableReference.from(metadata),
                                                         Collections.singletonList(colExpression),
-                                                        Collections.emptyMap());
+                                                        indexOptions);
                 String stmt = ddl.toCQL();
                 logger.info(stmt);
                 cluster.schemaChange(stmt);
@@ -644,6 +822,16 @@ public class SingleNodeTableWalkTest extends StatefulASTBase
                 indexed.put(symbol, new IndexedColumn(symbol, ddl));
             }
             return indexed;
+        }
+
+        public boolean allowLikeQuery()
+        {
+            return !model.isEmpty() && !searchableTextColumns.isEmpty();
+        }
+
+        public boolean allowCollectionQuery()
+        {
+            return !model.isEmpty() && !collectionColumns.isEmpty();
         }
 
         public boolean supportTokens()

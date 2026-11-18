@@ -34,7 +34,9 @@ import java.util.stream.Stream;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +48,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.io.compress.CompressedSequentialWriter;
 import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.compress.CorruptBlockException;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.schema.CompressionParams;
@@ -61,6 +64,9 @@ public class DirectCompressedChunkReaderTest extends CompressedChunkReaderTestBa
 
     private static final Logger logger = LoggerFactory.getLogger(DirectCompressedChunkReaderTest.class);
     private static int seed;
+
+    @Rule
+    public TemporaryFolder tempFolder = new TemporaryFolder();
 
     static
     {
@@ -168,6 +174,77 @@ public class DirectCompressedChunkReaderTest extends CompressedChunkReaderTestBa
     }
 
     @Test
+    public void corruptReadAheadBlockResetsBuffer()
+    {
+        int originalReadAheadBufferSizeInKb = DatabaseDescriptor.getCompressedReadAheadBufferSizeInKB();
+        // must exceed the chunk length, or forScan() does not read ahead
+        DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(256);
+        try
+        {
+            Gen<CompressionParams> compressionGen = compressionParams(Gens.constant(4096));
+
+            qt().withSeed(seed).forAll(Gens.random(), compressionGen).check((rs, params) -> {
+                long totalBytesToWrite = params.chunkLength() * 2L; // two chunks
+                List<ByteBuffer> chunks = generateRandomChunks(rs, params, totalBytesToWrite);
+                File dataFile = new File(tempFolder.newFile());
+
+                CompressionMetadata metadata;
+                try (CompressedSequentialWriter writer = getCompressedSequentialWriter(writerOption(1 << 10), params, dataFile))
+                {
+                    for (ByteBuffer chunk : chunks)
+                        writer.write(chunk.duplicate());
+                    writer.sync();
+                    metadata = writer.open(0);
+                }
+
+                ByteBuffer readBuffer = ByteBuffer.allocateDirect(metadata.chunkLength());
+                try (ChannelProxy channel = new ChannelProxy(dataFile, ChannelProxy.IOMode.DIRECT);
+                     CompressedChunkReader reader = new CompressedChunkReader.Direct(channel, metadata, () -> 1d);
+                     metadata)
+                {
+                    // The scan reader's read-ahead buffer captures the file size when it is created, so truncating
+                    // afterwards makes its next block load come up short.
+                    CompressedChunkReader scanReader = reader.forScan();
+                    try (scanReader)
+                    {
+                        Assert.assertNotSame("forScan() should read ahead", reader, scanReader);
+                        CompressionMetadata.Chunk firstChunkMeta = metadata.chunkFor(0);
+                        try (FileChannel fileChannel = FileChannel.open(dataFile.toPath(), StandardOpenOption.WRITE))
+                        {
+                            fileChannel.truncate(firstChunkMeta.offset + (long) firstChunkMeta.length / 2);
+                        }
+
+                        // Stale contents from an earlier read, which the reader must not expose after a failure
+                        while (readBuffer.hasRemaining())
+                            readBuffer.put((byte) 0x5A);
+                        readBuffer.flip();
+
+                        try
+                        {
+                            scanReader.readChunk(0, readBuffer);
+                            Assert.fail("Expected CorruptSSTableException for a short read-ahead block");
+                        }
+                        catch (CorruptSSTableException e)
+                        {
+                            Assert.assertTrue("Cause should identify the corrupt block, was " + e.getCause(),
+                                              e.getCause() instanceof CorruptBlockException);
+                            Assert.assertEquals("Reader must not see stale data after a failed read", 0, readBuffer.limit());
+                        }
+                    }
+                }
+                finally
+                {
+                    MemoryUtil.clean(readBuffer);
+                }
+            });
+        }
+        finally
+        {
+            DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(originalReadAheadBufferSizeInKb);
+        }
+    }
+
+    @Test
     public void uncompressedReads()
     {
         testUncompressedReads(false);
@@ -245,36 +322,43 @@ public class DirectCompressedChunkReaderTest extends CompressedChunkReaderTestBa
              CompressedChunkReader reader = new CompressedChunkReader.Direct(channel, metadata, () -> 1d);
              metadata)
         {
-            if (forScan)
-                reader.forScan();
-
-            long currentFileOffset = 0;
-            long totalBytesRead = 0;
-            int currentChunkIndex = 0;
-
-            while (totalBytesRead < totalBytesExpected)
+            // forScan() returns a per-scan reader that owns its read-ahead buffer; use it, then close it.
+            CompressedChunkReader scanReader = forScan ? reader.forScan() : reader;
+            try
             {
-                ByteBuffer currentExpectedChunk = expectedChunksData.get(currentChunkIndex);
+                long currentFileOffset = 0;
+                long totalBytesRead = 0;
+                int currentChunkIndex = 0;
 
-                readBuffer.clear();
-                reader.readChunk(currentFileOffset, readBuffer);
+                while (totalBytesRead < totalBytesExpected)
+                {
+                    ByteBuffer currentExpectedChunk = expectedChunksData.get(currentChunkIndex);
 
-                Assert.assertTrue("Read buffer is empty unexpectedly at offset " + currentFileOffset, readBuffer.hasRemaining());
+                    readBuffer.clear();
+                    scanReader.readChunk(currentFileOffset, readBuffer);
 
-                int actualBytesRead = readBuffer.remaining();
-                int expectedBytes = currentExpectedChunk.remaining();
+                    Assert.assertTrue("Read buffer is empty unexpectedly at offset " + currentFileOffset, readBuffer.hasRemaining());
 
-                Assert.assertTrue("Read buffer remaining (" + actualBytesRead + ") is less than expected (" + expectedBytes + ") at offset " + currentFileOffset,
-                                  actualBytesRead >= expectedBytes);
+                    int actualBytesRead = readBuffer.remaining();
+                    int expectedBytes = currentExpectedChunk.remaining();
 
-                int originalReadBufferLimit = readBuffer.limit();
-                readBuffer.limit(expectedBytes);
-                Assert.assertEquals("Mismatched data at offset " + currentFileOffset, currentExpectedChunk, readBuffer);
-                readBuffer.limit(originalReadBufferLimit);
+                    Assert.assertTrue("Read buffer remaining (" + actualBytesRead + ") is less than expected (" + expectedBytes + ") at offset " + currentFileOffset,
+                                      actualBytesRead >= expectedBytes);
 
-                totalBytesRead += expectedBytes;
-                currentFileOffset += metadata.chunkLength();
-                currentChunkIndex++;
+                    int originalReadBufferLimit = readBuffer.limit();
+                    readBuffer.limit(expectedBytes);
+                    Assert.assertEquals("Mismatched data at offset " + currentFileOffset, currentExpectedChunk, readBuffer);
+                    readBuffer.limit(originalReadBufferLimit);
+
+                    totalBytesRead += expectedBytes;
+                    currentFileOffset += metadata.chunkLength();
+                    currentChunkIndex++;
+                }
+            }
+            finally
+            {
+                if (scanReader != reader)
+                    scanReader.close();
             }
         }
         finally

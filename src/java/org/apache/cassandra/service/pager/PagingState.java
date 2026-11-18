@@ -19,13 +19,15 @@ package org.apache.cassandra.service.pager;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 
 import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -58,6 +60,8 @@ import static org.apache.cassandra.utils.vint.VIntCoding.getUnsignedVInt;
 @SuppressWarnings("WeakerAccess")
 public class PagingState
 {
+    private static final Logger logger = LoggerFactory.getLogger(PagingState.class);
+
     public final ByteBuffer partitionKey;  // Can be null for single partition queries.
     public final RowMark rowMark;          // Can be null if not needed.
     public final int remaining;
@@ -124,10 +128,14 @@ public class PagingState
         }
         catch (IOException e)
         {
-            throw new ProtocolException("Invalid value for the paging state");
+            String msg =  "Failed to deserialize the paging state with protocol version: " + protocolVersion;
+            logger.trace(msg, e);
+            throw new ProtocolException(msg, protocolVersion);
         }
 
-        throw new ProtocolException("Invalid value for the paging state");
+        String msg =  "The serialized paging state does not match any serialization format for protocol version: " + protocolVersion;
+        logger.trace(msg);
+        throw new ProtocolException(msg, protocolVersion);
     }
 
     /*
@@ -369,7 +377,7 @@ public class PagingState
             this.protocolVersion = protocolVersion;
         }
 
-        private static List<AbstractType<?>> makeClusteringTypes(TableMetadata metadata)
+        private static AbstractType<?>[] makeClusteringTypes(TableMetadata metadata)
         {
             // This is the types that will be used when serializing the clustering in the paging state. We can't really use the actual clustering
             // types however because we can't guarantee that there won't be a schema change between when we send the paging state and get it back,
@@ -377,9 +385,8 @@ public class PagingState
             // (say timestamp -> blob). So we simply use a list of BytesTypes (for both reading and writting), which may be slightly inefficient
             // for fixed-width types, but avoid any risk during schema changes.
             int size = metadata.clusteringColumns().size();
-            List<AbstractType<?>> l = new ArrayList<>(size);
-            for (int i = 0; i < size; i++)
-                l.add(BytesType.instance);
+            AbstractType<?>[] l = new AbstractType<?>[size];
+            Arrays.fill(l, BytesType.instance);
             return l;
         }
 

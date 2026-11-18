@@ -25,7 +25,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
@@ -49,6 +48,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.BooleanType;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.DecimalType;
@@ -80,7 +80,8 @@ public class IndexTermType
     private static final Set<AbstractType<?>> EQ_ONLY_TYPES = ImmutableSet.of(UTF8Type.instance,
                                                                               AsciiType.instance,
                                                                               BooleanType.instance,
-                                                                              UUIDType.instance);
+                                                                              UUIDType.instance,
+                                                                              BytesType.instance);
 
     private static final byte[] IPV4_PREFIX = new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1 };
 
@@ -104,6 +105,7 @@ public class IndexTermType
         BIG_DECIMAL,
         LONG,
         BOOLEAN,
+        BYTES,
         LITERAL,
         REVERSED,
         FROZEN,
@@ -147,7 +149,7 @@ public class IndexTermType
         AbstractType<?> baseType = indexType.unwrap();
 
         // We only need to inspect subtypes when it is possible for them to be queried individually.
-        if (baseType.subTypes().isEmpty() || indexTargetType == IndexTarget.Type.SIMPLE || indexTargetType == IndexTarget.Type.FULL)
+        if (baseType.subTypes().isEmpty() || !indexTargetType.hasElementTarget())
         {
             this.subTypes = Collections.emptyList();
         }
@@ -174,7 +176,7 @@ public class IndexTermType
 
     /**
      * Returns {@code true} if the index type is a literal type and will use a literal index. This applies to
-     * string types, frozen types, composite types and boolean type.
+     * string types, frozen types, composite types, bytes type and boolean type.
      */
     public boolean isLiteral()
     {
@@ -206,6 +208,14 @@ public class IndexTermType
     public boolean isReversed()
     {
         return capabilities.contains(Capability.REVERSED);
+    }
+
+    /**
+     * Returns {@code true} if the index type is a bytes/blob type.
+     */
+    public boolean isBytes()
+    {
+        return capabilities.contains(Capability.BYTES);
     }
 
     /**
@@ -461,15 +471,24 @@ public class IndexTermType
     }
 
     @Nullable
-    public Iterator<ByteBuffer> valuesOfFrozenCollection(Row row, long nowInSecs)
+    public Iterator<ByteBuffer> valuesOfFrozenCollection(DecoratedKey key, Row row, long nowInSecs)
     {
         if (row == null)
             return null;
 
         ByteBuffer buffer;
 
-        if (columnMetadata.kind == ColumnMetadata.Kind.CLUSTERING)
-             buffer = row.clustering().bufferAt(columnMetadata.position());
+        if (columnMetadata.kind == ColumnMetadata.Kind.PARTITION_KEY)
+        {
+            buffer = isCompositePartition() ? CompositeType.extractComponent(key.getKey(), columnMetadata.position()) : key.getKey();
+        }
+        else if (columnMetadata.kind == ColumnMetadata.Kind.CLUSTERING)
+        {
+            if (row.isStatic())
+                return null;
+
+            buffer = row.clustering().bufferAt(columnMetadata.position());
+        }
         else
         {
             Cell<?> cell = row.getCell(columnMetadata);
@@ -530,15 +549,6 @@ public class IndexTermType
         return result;
     }
 
-    public Comparator<ByteBuffer> comparator()
-    {
-        // Override the comparator for BigInteger, BigDecimal and composite types
-        if (isBigInteger() || isBigDecimal() || isComposite())
-            return FastByteOperations::compareUnsigned;
-
-        return indexType;
-    }
-
     /**
      * Compare two terms based on their type. This is used in place of {@link AbstractType#compare(ByteBuffer, ByteBuffer)}
      * so that the default comparison can be overridden for specific types.
@@ -557,6 +567,14 @@ public class IndexTermType
             return FastByteOperations.compareUnsigned(b1, b2);
 
         return indexType.compare(b1, b2);
+    }
+
+    /**
+     * Compare two terms by the column's natural (non-reversed) CQL order
+     */
+    public int compareUnwrapped(ByteBuffer b1, ByteBuffer b2)
+    {
+        return indexType.unwrap().compare(b1, b2);
     }
 
     /**
@@ -588,18 +606,28 @@ public class IndexTermType
     {
         if (isInetAddress())
             return compareInet(requestedValue.encoded, columnValue.encoded);
+        return comparePostFilterRaw(requestedValue.raw, columnValue.raw);
+    }
+
+    /**
+     * Exact comparison of two raw, undecorated term values for post-filtering
+     */
+    public int comparePostFilterRaw(ByteBuffer requestedValue, ByteBuffer columnValue)
+    {
+        if (isInetAddress())
+            return compareInet(asIndexBytes(requestedValue), asIndexBytes(columnValue));
         // bigint, decimal, and varint are not indexed in reversed byte-comparable form or treated as reversed types by
         // Expression, so it is correct to compare with the base/unwrapped type
         else if (isLong() || isBigDecimal() || isBigInteger())
-            return indexType.unwrap().compare(requestedValue.raw, columnValue.raw);
+            return indexType.unwrap().compare(requestedValue, columnValue);
         // Override comparisons for frozen collections and composite types (map entries)
         else if (isComposite() || isFrozen())
-            return FastByteOperations.compareUnsigned(requestedValue.raw, columnValue.raw);
+            return FastByteOperations.compareUnsigned(requestedValue, columnValue);
 
         // Reversed types are treated as such by Expression here, so we cannot blindly compare with the unwrapped type.
         // In the future, we might consider simplifying things to have SAI ignore reversed types altogether, but this
         // will require a change to the on-disk formats.
-        return indexType.compare(requestedValue.raw, columnValue.raw);
+        return indexType.compare(requestedValue, columnValue);
     }
 
     /**
@@ -778,8 +806,12 @@ public class IndexTermType
         if (indexType instanceof BooleanType)
             capabilities.add(Capability.BOOLEAN);
 
+        if (indexType instanceof BytesType)
+            capabilities.add(Capability.BYTES);
+
         if (capabilities.contains(Capability.STRING) ||
             capabilities.contains(Capability.BOOLEAN) ||
+            capabilities.contains(Capability.BYTES) ||
             capabilities.contains(Capability.FROZEN) ||
             capabilities.contains(Capability.COMPOSITE))
             capabilities.add(Capability.LITERAL);
@@ -819,7 +851,8 @@ public class IndexTermType
 
     private AbstractType<?> calculateIndexType(AbstractType<?> baseType, EnumSet<Capability> capabilities, IndexTarget.Type indexTargetType)
     {
-        if (IndexTarget.Type.FULL == indexTargetType)
+        // Non-element targets compare the whole collection, so they shouldn't reach collectionCellValueType()
+        if (!indexTargetType.hasElementTarget())
             return baseType;
         return capabilities.contains(Capability.COLLECTION) ? collectionCellValueType(baseType, indexTargetType) : baseType;
     }
@@ -928,14 +961,18 @@ public class IndexTermType
      */
     private static int compareInet(ByteBuffer b1, ByteBuffer b2)
     {
-        assert isIPv6(b1) && isIPv6(b2);
-
+        assert isEmptyOrIPv6(b1) && isEmptyOrIPv6(b2);
         return FastByteOperations.compareUnsigned(b1, b2);
     }
 
     private static boolean isIPv6(ByteBuffer address)
     {
         return address.remaining() == INET_ADDRESS_SIZE;
+    }
+
+    private static boolean isEmptyOrIPv6(ByteBuffer address)
+    {
+        return address.remaining() == 0 || isIPv6(address);
     }
 
     /**

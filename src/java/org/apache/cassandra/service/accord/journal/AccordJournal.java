@@ -56,7 +56,6 @@ import org.apache.cassandra.config.AccordConfig.JournalConfig;
 import org.apache.cassandra.config.AccordConfig.JournalConfig.ReplayMode;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.File;
@@ -78,7 +77,7 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static accord.api.Journal.Load.MINIMAL;
 import static accord.api.Journal.Load.MINIMAL_WITH_DEPS;
-import static accord.local.Cleanup.Input.FULL;
+import static accord.local.Cleanup.Input.FULL_UNSAFE;
 import static org.apache.cassandra.config.AccordConfig.RangeIndexMode.journal_sai;
 import static org.apache.cassandra.config.DatabaseDescriptor.getAccord;
 import static org.apache.cassandra.config.DatabaseDescriptor.getAccordJournalDirectory;
@@ -196,7 +195,7 @@ public class AccordJournal implements accord.api.Journal, RangeSearcher.Supplier
         return table.getTracker().getView().liveSSTables()
                     .stream()
                     .filter(sst -> sst.getSSTableMetadata().totalRows > 0)
-                    .map(sst -> LongType.instance.compose(sst.getSSTableMetadata().coveredClustering.end().bufferAt(0)))
+                    .map(TableKeyIterator::maxSegment)
                     .max(Long::compare).orElse(0L);
     }
 
@@ -214,7 +213,7 @@ public class AccordJournal implements accord.api.Journal, RangeSearcher.Supplier
     public Command loadCommand(int commandStoreId, TxnId txnId, RedundantBefore redundantBefore, DurableBefore durableBefore)
     {
         CommandChanges builder = load(commandStoreId, txnId);
-        builder.maybeCleanup(true, FULL, redundantBefore, durableBefore);
+        builder.maybeCleanup(true, FULL_UNSAFE, redundantBefore, durableBefore);
         return builder.construct(redundantBefore);
     }
 

@@ -260,7 +260,7 @@ public final class Guardrails implements GuardrailsMBean
                            "Filtering query with intersection on mutable columns at consistency level requiring coordinator reconciliation");
 
     /**
-     * Guardrail on the number of elements returned within page.
+     * Guardrail on the requested page size in rows.
      */
     public static final MaxThreshold pageSize =
     new MaxThreshold("page_size",
@@ -271,6 +271,20 @@ public final class Guardrails implements GuardrailsMBean
                      isWarning ? format("Query for table %s with page size %s exceeds warning threshold of %s.",
                                         what, value, threshold)
                                : format("Aborting query for table %s, page size %s exceeds fail threshold of %s.",
+                                        what, value, threshold));
+
+    /**
+     * Guardrail on the requested page size in bytes.
+     */
+    public static final MaxThreshold pageSizeInBytes =
+    new MaxThreshold("page_size_in_bytes",
+                     null,
+                     state -> sizeToBytes(CONFIG_PROVIDER.getOrCreate(state).getPageSizeInBytesWarnThreshold()),
+                     state -> sizeToBytes(CONFIG_PROVIDER.getOrCreate(state).getPageSizeInBytesFailThreshold()),
+                     (isWarning, what, value, threshold) ->
+                     isWarning ? format("Query for table %s with page size %s bytes exceeds warning threshold of %s bytes.",
+                                        what, value, threshold)
+                               : format("Aborting query for table %s, page size %s bytes exceeds fail threshold of %s bytes.",
                                         what, value, threshold));
 
     /**
@@ -616,6 +630,12 @@ public final class Guardrails implements GuardrailsMBean
                             what, value, isWarning ? "warning" : "failure", threshold));
 
     /**
+     * Guardrail on the minimum CMS size (aggregate replication factor across DCs).
+     */
+    public static final CMSSizeGuardrail minimumCmsSize =
+    new CMSSizeGuardrail(state -> CONFIG_PROVIDER.getOrCreate(state).getMinimumCmsSizeFailThreshold());
+
+    /**
      * Guardrail on the maximum replication factor.
      */
     public static final MaxThreshold maximumReplicationFactor =
@@ -667,6 +687,18 @@ public final class Guardrails implements GuardrailsMBean
                             what, value, isWarning ? "warning" : "failure", threshold));
 
     /**
+     * Guardrail on the size of a blob term written to SAI index.
+     */
+    public static final MaxThreshold saiBlobTermSize =
+    new MaxThreshold("sai_blob_term_size",
+                     null,
+                     state -> sizeToBytes(CONFIG_PROVIDER.getOrCreate(state).getSaiBlobTermSizeWarnThreshold()),
+                     state -> sizeToBytes(CONFIG_PROVIDER.getOrCreate(state).getSaiBlobTermSizeFailThreshold()),
+                     (isWarning, what, value, threshold) ->
+                     format("Value of column '%s' has size %s, this exceeds the %s threshold of %s.",
+                            what, value, isWarning ? "warning" : "failure", threshold));
+
+    /**
      * Guardrail on the size of a frozen term written to SAI index.
      */
     public static final MaxThreshold saiFrozenTermSize =
@@ -696,7 +728,7 @@ public final class Guardrails implements GuardrailsMBean
                    state -> CONFIG_PROVIDER.getOrCreate(state).getNonPartitionRestrictedQueryEnabled(),
                    "Non-partition key restricted query");
 
-    public static EnableFlag unsetTrainingMinFrequency =
+    public static final EnableFlag unsetTrainingMinFrequency =
     new EnableFlag("unset_training_min_frequency_enabled",
                    format("Table uses ZstdDictionaryCompressor without %s set. Unlimited training frequency may degrade " +
                           "compression quality and accumulate dictionaries in %s.%s. " +
@@ -711,6 +743,16 @@ public final class Guardrails implements GuardrailsMBean
 
     public static final PreparedStatementParameterRequirementGuardrail preparedStatementsRequireParameters =
     new PreparedStatementParameterRequirementGuardrail();
+
+    public static final MaxThreshold zstdCompressionLevelThreshold =
+    new MaxThreshold("zstd_compression_level",
+                     "Higher Zstd compression levels have detrimental " +
+                     "effects on CPU and memory usage while yielding almost no improvement on compression ratio.",
+                     state -> CONFIG_PROVIDER.getOrCreate(state).getZstdCompressionLevelWarnThreshold(),
+                     state -> CONFIG_PROVIDER.getOrCreate(state).getZstdCompressionLevelFailThreshold(),
+                     (isWarning, what, value, threshold) ->
+                     format("Value of Zstd compression level is '%s', this exceeds the %s threshold of %s.",
+                            value, isWarning ? "warning" : "failure", threshold));
 
     private Guardrails()
     {
@@ -1129,6 +1171,26 @@ public final class Guardrails implements GuardrailsMBean
     public void setPageSizeThreshold(int warn, int fail)
     {
         DEFAULT_CONFIG.setPageSizeThreshold(warn, fail);
+    }
+
+    @Override
+    @Nullable
+    public String getPageSizeInBytesWarnThreshold()
+    {
+        return sizeToString(DEFAULT_CONFIG.getPageSizeInBytesWarnThreshold());
+    }
+
+    @Override
+    @Nullable
+    public String getPageSizeInBytesFailThreshold()
+    {
+        return sizeToString(DEFAULT_CONFIG.getPageSizeInBytesFailThreshold());
+    }
+
+    @Override
+    public void setPageSizeInBytesThreshold(@Nullable String warnSize, @Nullable String failSize)
+    {
+        DEFAULT_CONFIG.setPageSizeInBytesThreshold(sizeFromString(warnSize), sizeFromString(failSize));
     }
 
     @Override
@@ -1671,6 +1733,18 @@ public final class Guardrails implements GuardrailsMBean
     }
 
     @Override
+    public int getMinimumCmsSizeFailThreshold()
+    {
+        return DEFAULT_CONFIG.getMinimumCmsSizeFailThreshold();
+    }
+
+    @Override
+    public void setMinimumCmsSizeFailThreshold(int fail)
+    {
+        DEFAULT_CONFIG.setMinimumCmsSizeFailThreshold(fail);
+    }
+
+    @Override
     public boolean getZeroTTLOnTWCSEnabled()
     {
         return DEFAULT_CONFIG.getZeroTTLOnTWCSEnabled();
@@ -1766,6 +1840,26 @@ public final class Guardrails implements GuardrailsMBean
     public void setSaiStringTermSizeThreshold(@Nullable String warnSize, @Nullable String failSize)
     {
         DEFAULT_CONFIG.setSaiStringTermSizeThreshold(sizeFromString(warnSize), sizeFromString(failSize));
+    }
+
+    @Override
+    @Nullable
+    public String getSaiBlobTermSizeWarnThreshold()
+    {
+        return sizeToString(DEFAULT_CONFIG.getSaiBlobTermSizeWarnThreshold());
+    }
+
+    @Override
+    @Nullable
+    public String getSaiBlobTermSizeFailThreshold()
+    {
+        return sizeToString(DEFAULT_CONFIG.getSaiBlobTermSizeFailThreshold());
+    }
+
+    @Override
+    public void setSaiBlobTermSizeThreshold(@Nullable String warnSize, @Nullable String failSize)
+    {
+        DEFAULT_CONFIG.setSaiBlobTermSizeThreshold(sizeFromString(warnSize), sizeFromString(failSize));
     }
 
     @Override
@@ -1946,6 +2040,24 @@ public final class Guardrails implements GuardrailsMBean
     public void setPreparedStatementsRequireParametersEnabled(boolean enabled)
     {
         DEFAULT_CONFIG.setPreparedStatementsRequireParametersEnabled(enabled);
+    }
+
+    @Override
+    public int getZstdCompressionLevelWarnThreshold()
+    {
+        return DEFAULT_CONFIG.getZstdCompressionLevelWarnThreshold();
+    }
+
+    @Override
+    public int getZstdCompressionLevelFailThreshold()
+    {
+        return DEFAULT_CONFIG.getZstdCompressionLevelFailThreshold();
+    }
+
+    @Override
+    public void setZstdCompressionLevelThreshold(int warn, int fail)
+    {
+        DEFAULT_CONFIG.setZstdCompressionLevelThreshold(warn, fail);
     }
 
     private static String toCSV(Set<String> values)

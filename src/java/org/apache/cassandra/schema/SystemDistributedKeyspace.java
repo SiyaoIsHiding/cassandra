@@ -55,6 +55,7 @@ import org.apache.cassandra.db.compression.CompressionDictionary;
 import org.apache.cassandra.db.compression.CompressionDictionary.LightweightCompressionDictionary;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.repair.CommonRange;
 import org.apache.cassandra.repair.messages.RepairOption;
@@ -421,6 +422,7 @@ public final class SystemDistributedKeyspace
      * @param tableName the table name to associate with the dictionary
      * @param tableId the unique id of a table to associate with the dictionary
      * @param dictionary the compression dictionary to store
+     * @throws RequestExecutionException when the dictionary can not be stored, e.g. when a quorum of replicas is not available
      */
     public static void storeCompressionDictionary(String keyspaceName,
                                                   String tableName,
@@ -439,9 +441,8 @@ public final class SystemDistributedKeyspace
                                  dictionary.dictId().id,
                                  dict.length,
                                  dictionary.checksum());
-        noThrow(fmtQuery,
-                () -> QueryProcessor.process(fmtQuery, ConsistencyLevel.ONE,
-                                             List.of(ByteBuffer.wrap(dict), ByteBufferUtil.bytes(dictionary.createdAt().toEpochMilli()))));
+        QueryProcessor.process(fmtQuery, ConsistencyLevel.QUORUM,
+                               List.of(ByteBuffer.wrap(dict), ByteBufferUtil.bytes(dictionary.createdAt().toEpochMilli())));
     }
 
     /**
@@ -460,10 +461,29 @@ public final class SystemDistributedKeyspace
         String fmtQuery = format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, COMPRESSION_DICTIONARIES, keyspaceName, tableName, tableId);
         try
         {
-            return CompressionDictionary.createFromRow(QueryProcessor.execute(fmtQuery, ConsistencyLevel.ONE).one());
+            // On startup, a table schedules this read when it opens, and it can run before this keyspace opens, more likely
+            // with a low value of compression_dictionary_refresh_initial_delay. Its instance is published only after all its
+            // tables opened, until then Keyspace.open fails on an assertion, which is an Error the callers would not handle.
+            if (Schema.instance.getKeyspaceInstance(SchemaConstants.DISTRIBUTED_KEYSPACE_NAME) == null)
+            {
+                logger.warn("Could not read the latest compression dictionary for {}.{}: keyspace {} is not loaded yet",
+                            keyspaceName, tableName, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME);
+                return null;
+            }
+
+            UntypedResultSet result = QueryProcessor.execute(fmtQuery, ConsistencyLevel.QUORUM);
+            // No row means this table has no dictionary stored, which is an ordinary state and not a read
+            // failure. It must not reach the catch below: one() throws on an empty result, so the warning
+            // would fire on every call for every such table, drowning out the failures it exists to surface.
+            if (result.isEmpty())
+                return null;
+            return CompressionDictionary.createFromRow(result.one());
         }
         catch (Exception e)
         {
+            // Never swallow this silently: callers treat null as "no dictionary" and carry on with a stale
+            // one, so an unavailable replica would otherwise look identical to a table that has none.
+            logger.warn("Could not read the latest compression dictionary for {}.{}", keyspaceName, tableName, e);
             return null;
         }
     }
@@ -485,10 +505,14 @@ public final class SystemDistributedKeyspace
         String fmtQuery = format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, COMPRESSION_DICTIONARIES, keyspaceName, tableName, tableId);
         try
         {
-            return CompressionDictionary.createFromRowLightweight(QueryProcessor.execute(fmtQuery, ConsistencyLevel.ONE).one());
+            UntypedResultSet result = QueryProcessor.execute(fmtQuery, ConsistencyLevel.QUORUM);
+            if (result.isEmpty())
+                return null;
+            return CompressionDictionary.createFromRowLightweight(result.one());
         }
         catch (Exception e)
         {
+            logger.warn("Could not read the latest compression dictionary metadata for {}.{}", keyspaceName, tableName, e);
             return null;
         }
     }
@@ -511,10 +535,24 @@ public final class SystemDistributedKeyspace
         String fmtQuery = format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, COMPRESSION_DICTIONARIES, keyspaceName, tableName, tableId, dictionaryId);
         try
         {
-            return CompressionDictionary.createFromRow(QueryProcessor.execute(fmtQuery, ConsistencyLevel.ONE).one());
+            // On startup, a table schedules this read when it opens, and it can run before this keyspace opens, more likely
+            // with a low value of compression_dictionary_refresh_initial_delay. Its instance is published only after all its
+            // tables opened, until then Keyspace.open fails on an assertion, which is an Error the callers would not handle.
+            if (Schema.instance.getKeyspaceInstance(SchemaConstants.DISTRIBUTED_KEYSPACE_NAME) == null)
+            {
+                logger.warn("Could not read compression dictionary {} for {}.{}: keyspace {} is not loaded yet",
+                            dictionaryId, keyspaceName, tableName, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME);
+                return null;
+            }
+
+            UntypedResultSet result = QueryProcessor.execute(fmtQuery, ConsistencyLevel.QUORUM);
+            if (result.isEmpty())
+                return null;
+            return CompressionDictionary.createFromRow(result.one());
         }
         catch (Exception e)
         {
+            logger.warn("Could not read compression dictionary {} for {}.{}", dictionaryId, keyspaceName, tableName, e);
             return null;
         }
     }
@@ -589,7 +627,7 @@ public final class SystemDistributedKeyspace
                                                      orphanedDict.tableName,
                                                      orphanedDict.tableId,
                                                      orphanedDict.dictId.id),
-                                       ConsistencyLevel.ONE);
+                                       ConsistencyLevel.QUORUM);
             }
             catch (Exception e)
             {
@@ -604,7 +642,7 @@ public final class SystemDistributedKeyspace
     {
         try
         {
-            UntypedResultSet result = QueryProcessor.execute(query, ConsistencyLevel.ONE);
+            UntypedResultSet result = QueryProcessor.execute(query, ConsistencyLevel.QUORUM);
             if (result.isEmpty())
                 return Collections.emptyList();
             List<LightweightCompressionDictionary> dictionaries = new ArrayList<>();

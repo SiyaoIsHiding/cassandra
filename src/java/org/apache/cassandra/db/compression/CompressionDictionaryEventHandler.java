@@ -32,6 +32,7 @@ import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.schema.SystemDistributedKeyspace;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Throwables;
 
 /**
  * Handles compression dictionary events including training completion and cluster notifications.
@@ -88,12 +89,32 @@ public class CompressionDictionaryEventHandler implements ICompressionDictionary
                 }
 
                 CompressionDictionary dictionary = SystemDistributedKeyspace.retrieveCompressionDictionary(keyspaceName, tableName, cfs.metadata().id.toLongString(), dictionaryId.id);
+                if (dictionary == null)
+                {
+                    // cache.add(null) is a no-op, so without this the node keeps writing with the dictionary it
+                    // already has and nothing anywhere says so. The periodic refresh is the only recovery, and
+                    // it runs on compression_dictionary_refresh_interval - an hour by default.
+                    logger.info("Notified of compression dictionary {} for {}.{} but could not read it back; " +
+                                "this node keeps using its current dictionary until the next periodic refresh.",
+                                dictionaryId, keyspaceName, tableName);
+                    return;
+                }
                 cache.add(dictionary);
             }
             catch (Exception e)
             {
                 logger.warn("Failed to retrieve compression dictionary for {}.{}. {}",
                             keyspaceName, tableName, dictionaryId, e);
+            }
+            catch (Error e)
+            {
+                // A drain of a node interrupts this task. A local read can run on this thread, then it fails e.g. with
+                // FSReadError, caused by ClosedByInterruptException, which is not a failure of the disk.
+                if (!(ScheduledExecutors.nonPeriodicTasks.isShutdown() && Throwables.isCausedByInterrupt(e)))
+                    throw e;
+
+                logger.info("Retrieval of compression dictionary {} for {}.{} stopped by the shutdown of the node: {}",
+                            dictionaryId, keyspaceName, tableName, e.getMessage());
             }
         });
     }

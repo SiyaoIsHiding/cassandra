@@ -86,6 +86,7 @@ public class Config
     public ParameterizedClass authenticator;
     public ParameterizedClass authorizer;
     public ParameterizedClass role_manager;
+    public ParameterizedClass default_role_initializer;
     public ParameterizedClass crypto_provider;
     public ParameterizedClass network_authorizer;
     public ParameterizedClass cidr_authorizer;
@@ -241,6 +242,17 @@ public class Config
     public volatile DurationSpec.LongMillisecondsBound cms_commit_timeout = new DurationSpec.LongMillisecondsBound("1h");
     public volatile DurationSpec.LongMillisecondsBound cms_commit_retry_initial_delay = new DurationSpec.LongMillisecondsBound("5s");
     public volatile DurationSpec.LongMillisecondsBound cms_commit_retry_max_delay = new DurationSpec.LongMillisecondsBound("60s");
+
+    /**
+     * Deadline for removing a node from the CMS when a CMS reconfiguration is already in progress.
+     * Only one reconfiguration may be prepared at a time, so the removal waits for the in-flight one to complete,
+     * re-checking with backoff governed by cms_commit_retry_initial_delay/cms_commit_retry_max_delay,
+     * until this deadline expires. Must be positive.
+     *
+     * Note that a deadline shorter than cms_commit_timeout does not interrupt a commit already in flight; it only
+     * stops further attempts from being made.
+     */
+    public volatile DurationSpec.LongMillisecondsBound cms_reconfiguration_wait_timeout = new DurationSpec.LongMillisecondsBound("10m");
 
     public volatile int epoch_aware_debounce_inflight_tracker_max_size = 100;
 
@@ -550,7 +562,7 @@ public class Config
     public volatile boolean use_creation_time_for_hint_ttl = true;
 
     public volatile boolean incremental_backups = false;
-    public boolean trickle_fsync = false;
+    public boolean trickle_fsync = true;
     @Replaces(oldName = "trickle_fsync_interval_in_kb", converter = Converters.KIBIBYTES_DATASTORAGE, deprecated = true)
     public DataStorageSpec.IntKibibytesBound trickle_fsync_interval = new DataStorageSpec.IntKibibytesBound("10240KiB");
 
@@ -814,6 +826,11 @@ public class Config
     public volatile int max_concurrent_automatic_sstable_upgrades = 1;
     public boolean stream_entire_sstables = true;
 
+    /**
+     * When receiving a zero-copy stream, validate Digest.crc32 before the sstable is made visible.
+     */
+    public volatile boolean entire_sstable_stream_digest_validation_enabled = true;
+
     public volatile boolean skip_stream_disk_space_check = false;
 
     public volatile AuditLogOptions audit_logging_options = new AuditLogOptions();
@@ -912,6 +929,8 @@ public class Config
 
     public StorageAttachedIndexOptions sai_options = new StorageAttachedIndexOptions();
 
+    public volatile DataStorageSpec.IntBytesBound aggregation_subpage_size = new DataStorageSpec.IntBytesBound(2, DataStorageSpec.DataStorageUnit.MEBIBYTES);
+
     /**
      * @deprecated migrate to {@link DatabaseDescriptor#isClientInitialized()} See CASSANDRA-12550
      */
@@ -981,6 +1000,8 @@ public class Config
     public volatile int materialized_views_per_table_fail_threshold = -1;
     public volatile int page_size_warn_threshold = -1;
     public volatile int page_size_fail_threshold = -1;
+    public volatile DataStorageSpec.LongBytesBound page_size_in_bytes_warn_threshold = null;
+    public volatile DataStorageSpec.LongBytesBound page_size_in_bytes_fail_threshold = null;
     public volatile int partition_keys_in_select_warn_threshold = -1;
     public volatile int partition_keys_in_select_fail_threshold = -1;
     public volatile int in_select_cartesian_product_warn_threshold = -1;
@@ -1060,6 +1081,7 @@ public class Config
     public volatile int minimum_replication_factor_fail_threshold = -1;
     public volatile int maximum_replication_factor_warn_threshold = -1;
     public volatile int maximum_replication_factor_fail_threshold = -1;
+    public volatile int minimum_cms_size_fail_threshold = -1;
     public volatile boolean zero_ttl_on_twcs_warned = true;
     public volatile boolean zero_ttl_on_twcs_enabled = true;
     public volatile boolean non_partition_restricted_index_query_enabled = true;
@@ -1075,10 +1097,15 @@ public class Config
     public volatile int sai_sstable_indexes_per_query_fail_threshold = -1;
     public volatile DataStorageSpec.LongBytesBound sai_string_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
     public volatile DataStorageSpec.LongBytesBound sai_string_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_blob_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_blob_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
     public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
     public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
     public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("16KiB");
     public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("32KiB");
+
+    public volatile int zstd_compression_level_warn_threshold = -1;
+    public volatile int zstd_compression_level_fail_threshold = -1;
 
     public volatile DurationSpec.LongNanosecondsBound streaming_state_expires = new DurationSpec.LongNanosecondsBound("3d");
     public volatile DataStorageSpec.LongBytesBound streaming_state_size = new DataStorageSpec.LongBytesBound("40MiB");

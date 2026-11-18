@@ -199,14 +199,26 @@ public interface GuardrailsConfig
     boolean getBulkLoadEnabled();
 
     /**
-     * @return The threshold to warn when page size exceeds given size.
+     * @return The threshold to warn when a requested row page size exceeds the given number of rows.
      */
     int getPageSizeWarnThreshold();
 
     /**
-     * @return The threshold to fail when page size exceeds given size.
+     * @return The threshold to fail when a requested row page size exceeds the given number of rows.
      */
     int getPageSizeFailThreshold();
+
+    /**
+     * @return The threshold to warn when a requested byte page size exceeds the given size. {@code null} disables it.
+     */
+    @Nullable
+    DataStorageSpec.LongBytesBound getPageSizeInBytesWarnThreshold();
+
+    /**
+     * @return The threshold to fail when a requested byte page size exceeds the given size. {@code null} disables it.
+     */
+    @Nullable
+    DataStorageSpec.LongBytesBound getPageSizeInBytesFailThreshold();
 
     /**
      * Returns whether list operations that require read before write are allowed.
@@ -467,6 +479,11 @@ public interface GuardrailsConfig
     int getMinimumReplicationFactorFailThreshold();
 
     /**
+     * @return The threshold to fail when the CMS size (aggregate replication factor across DCs) is below the threshold.
+     */
+    int getMinimumCmsSizeFailThreshold();
+
+    /**
      * @return The threshold to warn when replication factor is greater than threshold.
      */
     int getMaximumReplicationFactorWarnThreshold();
@@ -606,6 +623,24 @@ public interface GuardrailsConfig
     void setSaiStringTermSizeThreshold(@Nullable DataStorageSpec.LongBytesBound warn, @Nullable DataStorageSpec.LongBytesBound fail);
 
     /**
+     * @return the warning threshold for the size of blob terms written to an SAI index
+     */
+    DataStorageSpec.LongBytesBound getSaiBlobTermSizeWarnThreshold();
+
+    /**
+     * @return the failure threshold for the size of blob terms written to an SAI index
+     */
+    DataStorageSpec.LongBytesBound getSaiBlobTermSizeFailThreshold();
+
+    /**
+     * Sets warning and failure thresholds for the size of blob terms written to an SAI index
+     *
+     * @param warn value to set for warn threshold
+     * @param fail value to set for fail threshold
+     */
+    void setSaiBlobTermSizeThreshold(@Nullable DataStorageSpec.LongBytesBound warn, @Nullable DataStorageSpec.LongBytesBound fail);
+
+    /**
      * @return the warning threshold for the size of frozen terms written to an SAI index
      */
     DataStorageSpec.LongBytesBound getSaiFrozenTermSizeWarnThreshold();
@@ -734,4 +769,22 @@ public interface GuardrailsConfig
      * @param enabled {@code true} to reject, {@code false} to allow.
      */
     void setPreparedStatementsRequireParametersEnabled(boolean enabled);
+
+    /**
+     * @return the warning threshold for the Zstd compressor level
+     */
+    int getZstdCompressionLevelWarnThreshold();
+
+    /**
+     * @return the failure threshold for the Zstd compressor level
+     */
+    int getZstdCompressionLevelFailThreshold();
+
+    /**
+     * Sets warning and failure thresholds for the Zstd compressor levels.
+     *
+     * @param warn value to set for warn threshold
+     * @param fail value to set for fail threshold
+     */
+    void setZstdCompressionLevelThreshold(int warn, int fail);
 }

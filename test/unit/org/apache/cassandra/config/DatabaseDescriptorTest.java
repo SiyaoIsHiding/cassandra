@@ -513,6 +513,51 @@ public class DatabaseDescriptorTest
     }
 
     @Test
+    public void testZeroMemtableOffheapSpaceRejectedForOffheapAllocationTypes()
+    {
+        // off-heap allocators must not be configured with an off-heap space of 0
+        for (Config.MemtableAllocationType type : EnumSet.of(Config.MemtableAllocationType.offheap_buffers,
+                                                            Config.MemtableAllocationType.offheap_objects))
+        {
+            Config conf = new Config();
+            conf.memtable_allocation_type = type;
+            conf.memtable_offheap_space = new DataStorageSpec.IntMebibytesBound(0);
+
+            assertThatExceptionOfType(ConfigurationException.class)
+                .isThrownBy(() -> DatabaseDescriptor.applyMemtableSpace(conf))
+                .withMessageContaining("memtable_offheap_space must be positive")
+                .withMessageContaining(type.toString());
+        }
+    }
+
+    @Test
+    public void testZeroMemtableOffheapSpaceAllowedForHeapAllocationTypes()
+    {
+        for (Config.MemtableAllocationType type : EnumSet.of(Config.MemtableAllocationType.heap_buffers,
+                                                             Config.MemtableAllocationType.unslabbed_heap_buffers,
+                                                             Config.MemtableAllocationType.unslabbed_heap_buffers_logged))
+        {
+            Config conf = new Config();
+            conf.memtable_allocation_type = type;
+            conf.memtable_offheap_space = new DataStorageSpec.IntMebibytesBound(0);
+
+            DatabaseDescriptor.applyMemtableSpace(conf);
+            assertThat(conf.memtable_heap_space.toMebibytes()).isGreaterThan(0);
+        }
+    }
+
+    @Test
+    public void testZeroMemtableHeapSpaceIsRejected()
+    {
+        Config conf = new Config();
+        conf.memtable_heap_space = new DataStorageSpec.IntMebibytesBound(0);
+
+        assertThatExceptionOfType(ConfigurationException.class)
+            .isThrownBy(() -> DatabaseDescriptor.applyMemtableSpace(conf))
+            .withMessageContaining("memtable_heap_space must be positive");
+    }
+
+    @Test
     public void testConcurrentValidations()
     {
         Config conf = new Config();
@@ -1259,5 +1304,31 @@ public class DatabaseDescriptorTest
         {
             DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(original);
         }
+    }
+
+    @Test
+    public void testCmsReconfigurationWaitTimeoutRejectsZeroAtStartup()
+    {
+        Config config = DatabaseDescriptor.loadConfig();
+        config.cms_reconfiguration_wait_timeout = new DurationSpec.LongMillisecondsBound("0ms");
+        try
+        {
+            assertThatThrownBy(() -> DatabaseDescriptor.unsafeDaemonInitialization(() -> config))
+                .isInstanceOf(ConfigurationException.class)
+                .hasMessageContaining("cms_reconfiguration_wait_timeout must be positive");
+        }
+        finally
+        {
+            // restore a valid config for the remaining tests in this class
+            DatabaseDescriptor.unsafeDaemonInitialization(DatabaseDescriptor::loadConfig);
+        }
+    }
+
+    @Test
+    public void testCmsReconfigurationWaitTimeoutSetterRejectsZero()
+    {
+        assertThatThrownBy(() -> DatabaseDescriptor.setCmsReconfigurationWaitTimeout(0))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("cms_reconfiguration_wait_timeout must be positive");
     }
 }

@@ -39,6 +39,7 @@ import accord.local.DurableBefore;
 import accord.local.MaxConflicts;
 import accord.local.MaxDecidedRX;
 import accord.local.RedundantBefore;
+import accord.local.RedundantStatus;
 import accord.primitives.Range;
 import accord.primitives.Ranges;
 import accord.primitives.SaveStatus;
@@ -177,7 +178,7 @@ public class CommandStoreSerializers
         }
     }
 
-    static class ReducingRangeMapSerializer<T, Map extends ReducingRangeMap<T>> extends AbstractReducingRangeMapSerializer<T, Map> implements UnversionedSerializer<Map>
+    public static class ReducingRangeMapSerializer<T, Map extends ReducingRangeMap<T>> extends AbstractReducingRangeMapSerializer<T, Map> implements UnversionedSerializer<Map>
     {
         final UnversionedSerializer<T> defaultValueSerializer;
 
@@ -272,11 +273,13 @@ public class CommandStoreSerializers
             }
         }
 
-        private short cast(long v)
+        private int cast(long v)
         {
-            if ((v & ~0xFFFF) != 0)
+            if (v < 0 || v >= (1 << RedundantStatus.Property.WAS_OWNED.ordinal()))
+                throw new IllegalStateException("Should not be serializing WAS_OWNED or NOT_OWNED statuses");
+            if ((v & ~0xFFFF) != 0) // retain this
                 throw new IllegalStateException("Cannot serialize RedundantStatus larger than 0xFFFF. Requires serialization changes.");
-            return (short)v;
+            return (int) v;
         }
 
         @Override
@@ -298,7 +301,7 @@ public class CommandStoreSerializers
                 bounds[i] = CommandSerializers.txnId.deserialize(in);
             int[] statuses = new int[count * 2];
             for (int i = 0 ; i < statuses.length ; ++i)
-                statuses[i] = in.readShort();
+                statuses[i] = in.readShort() & 0xFFFF;
 
             return new RedundantBefore.Bounds(range, startEpoch, endEpoch, bounds, statuses, staleUntilAtLeast);
         }
@@ -819,7 +822,7 @@ public class CommandStoreSerializers
             byte flags = (byte) ((t.getClass() == IdSingleEntry.class) ? 0 : 1);
             out.writeByte(flags);
             CommandSerializers.txnId.serialize(t, out);
-            out.writeUnsignedVInt32(t.encoded());
+            out.writeUnsignedVInt32(t.serialize());
             if (flags == 0)
             {
                 IdSingleEntry e = (IdSingleEntry) t;
